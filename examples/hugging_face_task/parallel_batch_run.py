@@ -7,7 +7,7 @@ projects. Each worker gets its own COMPOSE_PROJECT_NAME, ENV_PORT, and ENV_URL,
 so environment resets do not collide.
 
 The script is resume-safe: already graded runs are skipped when
-output/<task_id>/<trial_id>/grades.json exists and is non-empty.
+outputs/<model_name>/<task_id>/<trial_id>/grades.json exists and is non-empty.
 
 Examples from the repository root:
     agents/.venv/bin/python examples/hugging_face_task/parallel_batch_run.py --workers 2 --trials 1
@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -128,12 +129,38 @@ def load_tasks_and_worlds() -> tuple[list[dict], dict[str, dict]]:
     return tasks, {w["world_id"]: w for w in worlds_list}
 
 
-def output_dir_for(task_id: str, trial_id: str) -> Path:
-    return EXAMPLE_DIR / "output" / task_id / trial_id
+def load_orchestrator_model() -> str:
+    with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
+        config = json.load(f)
+    model = config.get("model")
+    if not model:
+        raise SystemExit("orchestrator_config.json must define a non-empty model")
+    return str(model)
 
 
-def grades_exist(task_id: str, trial_id: str) -> bool:
-    grades = output_dir_for(task_id, trial_id) / "grades.json"
+def model_output_name(model: str) -> str:
+    name = model.rsplit("/", 1)[-1].strip()
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return safe_name or "unknown-model"
+
+
+def resolve_output_root(output_root: str, model: str) -> Path:
+    if output_root:
+        root = Path(output_root).expanduser()
+    else:
+        root = EXAMPLE_DIR / "outputs" / model_output_name(model)
+
+    if not root.is_absolute():
+        root = EXAMPLE_DIR / root
+    return root.resolve()
+
+
+def output_dir_for(task_id: str, trial_id: str, output_root: Path) -> Path:
+    return output_root / task_id / trial_id
+
+
+def grades_exist(task_id: str, trial_id: str, output_root: Path) -> bool:
+    grades = output_dir_for(task_id, trial_id, output_root) / "grades.json"
     return grades.exists() and grades.stat().st_size > 0
 
 
@@ -340,7 +367,7 @@ def run_process(
 
 
 def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tuple[int, float, bool, Path | None]:
-    output_dir = output_dir_for(item.task_id, item.trial_id)
+    output_dir = output_dir_for(item.task_id, item.trial_id, args.output_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = None if args.stream_logs else output_dir / "run.log"
 
@@ -350,6 +377,7 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
     env["ENV_PORT"] = str(spec.port)
     env["ENV_URL"] = f"http://localhost:{spec.port}"
     env["ENVIRONMENT_BUILD"] = "1" if args.build_per_run else "0"
+    env["OUTPUT_DIR"] = str(args.output_root)
 
     cmd = [sys.executable, str(EXAMPLE_DIR / "main.py"), item.task_id]
 
@@ -399,7 +427,7 @@ def worker_loop(
             return
 
         try:
-            if grades_exist(item.task_id, item.trial_id):
+            if grades_exist(item.task_id, item.trial_id, args.output_root):
                 with stats_lock:
                     stats.skipped += 1
                     log(f"[w{spec.worker_id}] SKIP already graded: {item.task_id} {item.trial_id}")
@@ -414,7 +442,7 @@ def worker_loop(
                 )
 
             rc, elapsed, timed_out, log_path = run_single(item, spec, args)
-            graded = grades_exist(item.task_id, item.trial_id)
+            graded = grades_exist(item.task_id, item.trial_id, args.output_root)
             succeeded = rc == 0 and graded
 
             with stats_lock:
@@ -444,13 +472,18 @@ def parse_args() -> argparse.Namespace:
         description="Run HuggingFace benchmark tasks in parallel with isolated Docker Compose workers.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--workers", type=positive_int, default=64, help="Number of parallel environment workers")
-    parser.add_argument("--base-port", type=int, default=8090, help="First host port; workers use base-port + worker_id")
+    parser.add_argument("--workers", type=positive_int, default=8, help="Number of parallel environment workers")
+    parser.add_argument("--base-port", type=int, default=9090, help="First host port; workers use base-port + worker_id")
     parser.add_argument("--project-prefix", default="archipelago_bench", help="Compose project prefix for worker containers")
     parser.add_argument("--trials", type=positive_int, default=1, help="Number of trials per task")
     parser.add_argument("--start-index", type=int, default=0, help="Skip the first N selected tasks")
     parser.add_argument("--limit", type=int, default=0, help="Max selected tasks to process; 0 means all")
     parser.add_argument("--task-timeout", type=int, default=7200, help="Seconds per (task, trial) attempt")
+    parser.add_argument(
+        "--output-root",
+        default=os.environ.get("OUTPUT_DIR", ""),
+        help="Directory for run outputs; defaults to outputs/<model_name> under this example",
+    )
     parser.add_argument("--only-task-ids", default="", help="Comma-separated task IDs to run")
     parser.add_argument("--exclude-task-ids", default="", help="Comma-separated task IDs to skip")
     parser.add_argument("--exclude-task-id-file", default="", help="File containing task IDs to skip, one per line")
@@ -483,10 +516,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    orchestrator_model = load_orchestrator_model()
+    args.output_root = resolve_output_root(args.output_root, orchestrator_model)
+
+    log(f"Orchestrator model: {orchestrator_model}")
+    log(f"Output root: {args.output_root}")
+
     tasks = select_tasks(args)
     runs = build_run_plan(tasks, args.trials)
-    already_graded = sum(1 for item in runs if grades_exist(item.task_id, item.trial_id))
-    pending_runs = [item for item in runs if not grades_exist(item.task_id, item.trial_id)]
+    already_graded = sum(1 for item in runs if grades_exist(item.task_id, item.trial_id, args.output_root))
+    pending_runs = [item for item in runs if not grades_exist(item.task_id, item.trial_id, args.output_root)]
 
     log(f"Planned runs: {len(runs)} ({len(tasks)} tasks x {args.trials} trials)")
     log(f"Resume state: {already_graded} already graded, {len(pending_runs)} pending")

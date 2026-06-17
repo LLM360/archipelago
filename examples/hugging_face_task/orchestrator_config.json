@@ -1,5 +1,5 @@
 {
-  "model": "openai/k2v3-32b-stage2-v3-12500",
+  "model": "openai/k2v3-8b-stage4-final",
   "extra_args": {
     "api_base": "http://localhost:8567/v1",
     "api_key": "dummy"

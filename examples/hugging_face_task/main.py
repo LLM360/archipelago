@@ -43,6 +43,17 @@ def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def resolve_output_root() -> Path:
+    output_dir = os.environ.get("OUTPUT_DIR")
+    if not output_dir:
+        return EXAMPLE_DIR / "output"
+
+    root = Path(output_dir).expanduser()
+    if not root.is_absolute():
+        root = EXAMPLE_DIR / root
+    return root.resolve()
+
+
 def populate_subsystems(root: Path, output_dir: Path, label: str):
     """Populate environment with filesystem/ and .apps_data/ from a directory."""
     for subsystem in SUBSYSTEMS:
@@ -184,7 +195,7 @@ def main():
     trajectory_id = f"hf_{task['task_id']}_{uuid.uuid4().hex[:8]}"
     grading_run_id = f"gr_{uuid.uuid4().hex[:8]}"
     trial_id = os.environ.get("TRIAL_ID", "")
-    output_dir = EXAMPLE_DIR / "output" / task["task_id"]
+    output_dir = resolve_output_root() / task["task_id"]
     if trial_id:
         output_dir = output_dir / trial_id
     output_dir.mkdir(parents=True, exist_ok=True)
