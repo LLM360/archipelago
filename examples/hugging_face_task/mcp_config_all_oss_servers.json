@@ -5,6 +5,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -19,6 +20,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -34,6 +36,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -48,6 +51,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -62,6 +66,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -77,6 +82,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -91,6 +97,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -105,6 +112,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],
@@ -119,6 +127,7 @@
       "command": "uv",
       "args": [
         "run",
+        "--no-sync",
         "python",
         "main.py"
       ],

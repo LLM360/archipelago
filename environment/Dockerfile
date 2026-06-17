@@ -51,6 +51,14 @@ RUN cd /app/mcp_servers/presentations/mcp_servers/slides_server && uv sync --all
 # Install: code
 RUN cd /app/mcp_servers/code/mcp_servers/code_execution_server && export INSTALL_MEDICINE=false INSTALL_SCICOMP=false && apt-get update -qq && apt-get install -y -qq proot; GROUPS=""; [ "$INSTALL_MEDICINE" = "true" ] && GROUPS="$GROUPS --group medicine"; [ "$INSTALL_SCICOMP" = "true" ] && GROUPS="$GROUPS --group scicomp"; uv sync --all-extras$GROUPS
 
+# Compile sandbox_fs.so for the LD_PRELOAD sandbox used by code_execution_server
+# (upstream Dockerfile omits this, so the server crashes on startup with RuntimeError)
+RUN mkdir -p /app/lib && \
+    gcc -shared -fPIC -O2 \
+        -o /app/lib/sandbox_fs.so \
+        /app/mcp_servers/code/mcp_servers/code_execution_server/sandbox_fs.c \
+        -ldl -lpthread
+
 # Install: pdfs
 RUN cd /app/mcp_servers/pdfs/mcp_servers/pdf_server && uv sync --all-extras
 

@@ -75,7 +75,7 @@ def populate_subsystems(root: Path, output_dir: Path, label: str):
             log(f"  {subsystem}: {resp.json()}")
 
 
-def wait_for_health(url: str, timeout: int = 120) -> bool:
+def wait_for_health(url: str, timeout: int = 480) -> bool:
     """Wait for environment to be healthy."""
     start = time.time()
     while time.time() - start < timeout:
@@ -105,10 +105,16 @@ def start_environment():
         ["docker", "compose", "down", "-v"], cwd=ENVIRONMENT_DIR, capture_output=True
     )
 
-    log("Building and starting environment container...")
-    result = subprocess.run(
-        ["docker", "compose", "up", "-d", "--build"], cwd=ENVIRONMENT_DIR
-    )
+    build_setting = os.environ.get("ENVIRONMENT_BUILD", "1").strip().lower()
+    build_each_run = build_setting not in {"0", "false", "no", "off"}
+    compose_up_cmd = ["docker", "compose", "up", "-d"]
+    compose_up_cmd.append("--build" if build_each_run else "--no-build")
+
+    if build_each_run:
+        log("Building and starting environment container...")
+    else:
+        log("Starting environment container without rebuilding...")
+    result = subprocess.run(compose_up_cmd, cwd=ENVIRONMENT_DIR)
     if result.returncode != 0:
         log("ERROR: Failed to start environment")
         sys.exit(1)
@@ -177,7 +183,10 @@ def main():
 
     trajectory_id = f"hf_{task['task_id']}_{uuid.uuid4().hex[:8]}"
     grading_run_id = f"gr_{uuid.uuid4().hex[:8]}"
+    trial_id = os.environ.get("TRIAL_ID", "")
     output_dir = EXAMPLE_DIR / "output" / task["task_id"]
+    if trial_id:
+        output_dir = output_dir / trial_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
     log("=" * 60)
@@ -222,7 +231,7 @@ def main():
         mcp_config = json.load(f)
     log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
 
-    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=600.0)
+    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=1200.0)
     resp.raise_for_status()
     log("MCP servers configured")
 

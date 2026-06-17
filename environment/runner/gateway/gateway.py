@@ -89,7 +89,7 @@ def _build_mcp_app_with_proxy(
 async def warm_and_check_gateway(
     mcp_proxy: FastMCP,
     expected_servers: list[str],
-    max_wait_seconds: float = 300.0,
+    max_wait_seconds: float = 900.0,
     retry_interval: float = 1.0,
 ) -> int:
     """Warm up gateway connections and verify all servers are ready.

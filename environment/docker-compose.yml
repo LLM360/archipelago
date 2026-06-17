@@ -4,9 +4,8 @@ services:
     build:
       context: ..
       dockerfile: environment/Dockerfile
-    container_name: archipelago-environment
     ports:
-      - "8080:8080"
+      - "${ENV_PORT:-8080}:8080"
     env_file:
       - .env
     healthcheck:

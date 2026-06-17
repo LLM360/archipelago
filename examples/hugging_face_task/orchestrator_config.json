@@ -1,3 +1,7 @@
 {
-  "model": "gemini/gemini-3-pro-preview"
+  "model": "openai/k2v3-32b-stage2-v3-12500",
+  "extra_args": {
+    "api_base": "http://localhost:8567/v1",
+    "api_key": "dummy"
+  }
 }

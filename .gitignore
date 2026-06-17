@@ -216,10 +216,13 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Archipelago specific
-output/
-outputs/
+*output/
+*outputs/
 *.tar.gz
 
 # OS files
 .DS_Store
 Thumbs.db
+
+*.example
+*uv.lock
