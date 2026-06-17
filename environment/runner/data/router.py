@@ -10,6 +10,7 @@ The router is mounted at the /data prefix in the main FastAPI application.
 """
 
 import json
+import shutil
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
@@ -24,7 +25,13 @@ from .populate.models import (
     PopulateResult,
     PopulateStreamResult,
 )
-from .snapshot import handle_snapshot, handle_snapshot_s3, handle_snapshot_s3_files
+from .populate.streaming import get_subsystem_paths
+from .snapshot import (
+    handle_snapshot,
+    handle_snapshot_s3,
+    handle_snapshot_s3_files,
+    handle_snapshot_zip,
+)
 from .snapshot.models import (
     SnapshotFilesResult,
     SnapshotRequest,
@@ -33,6 +40,37 @@ from .snapshot.models import (
 )
 
 router = APIRouter()
+
+
+def _clear_directory_contents(path) -> int:
+    """Remove all children under path while preserving the root directory."""
+    path.mkdir(parents=True, exist_ok=True)
+    removed = 0
+    for child in path.iterdir():
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+    return removed
+
+
+@router.post("/reset")
+async def reset_data() -> dict:
+    """Clear mutable subsystem state without restarting the environment."""
+    try:
+        results = {}
+        for name, path in get_subsystem_paths().items():
+            removed = _clear_directory_contents(path)
+            results[name] = {"path": str(path), "entries_removed": removed}
+        logger.info(f"Reset data subsystems: {results}")
+        return {"subsystems": results}
+    except Exception as e:
+        logger.error(f"Reset failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/populate", response_model=PopulateStreamResult)
@@ -180,6 +218,37 @@ async def snapshot(request: SnapshotStreamRequest | None = None):
         raise
     except Exception as e:
         logger.error(f"Error creating snapshot: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/snapshot/zip")
+async def snapshot_zip(
+    request: SnapshotStreamRequest | None = None,
+    compression: str = Query(
+        default="stored",
+        description="Zip compression: stored (fastest) or deflated (smaller)",
+    ),
+):
+    """Create a zip snapshot of all subsystems and stream it back."""
+    hooks_count = len(request.pre_snapshot_hooks) if request else 0
+    logger.debug(
+        f"Zip snapshot request received (hooks={hooks_count}, compression={compression})"
+    )
+    try:
+        hooks = request.pre_snapshot_hooks if request else None
+        stream, filename = await handle_snapshot_zip(
+            pre_snapshot_hooks=hooks, compression=compression
+        )
+        logger.debug(f"Zip snapshot stream created: {filename}")
+        return StreamingResponse(
+            stream,
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating zip snapshot: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 

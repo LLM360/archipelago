@@ -8,6 +8,7 @@ Usage:
     ./run.sh task_abc123  # Run task by ID
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -18,6 +19,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -43,6 +45,13 @@ def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def resolve_output_root() -> Path:
     output_dir = os.environ.get("OUTPUT_DIR")
     if not output_dir:
@@ -54,36 +63,245 @@ def resolve_output_root() -> Path:
     return root.resolve()
 
 
-def populate_subsystems(root: Path, output_dir: Path, label: str):
-    """Populate environment with filesystem/ and .apps_data/ from a directory."""
-    for subsystem in SUBSYSTEMS:
-        subsystem_dir = root / subsystem
-        if not subsystem_dir.exists():
-            continue
-        entries = list(subsystem_dir.rglob("*"))
-        if not entries:
-            continue
+def archive_cache_root() -> Path:
+    cache_dir = os.environ.get("ARCHIVE_CACHE_DIR") or os.environ.get(
+        "PREPARED_ARCHIVE_CACHE_DIR"
+    )
+    if cache_dir:
+        root = Path(cache_dir).expanduser()
+        if not root.is_absolute():
+            root = EXAMPLE_DIR / root
+    else:
+        root = EXAMPLE_DIR / ".cache" / "prepared_archives"
+    root.mkdir(parents=True, exist_ok=True)
+    return root.resolve()
 
-        file_count = sum(1 for p in entries if p.is_file())
-        log(f"  Populating {label} {subsystem} ({file_count} files, {len(entries) - file_count} directories)...")
-        tar_path = output_dir / f"{label}_{subsystem}.tar.gz"
 
-        with tarfile.open(tar_path, "w:gz") as tar:
-            tar.dereference = True  # Follow symlinks; HF stores files as symlinks to blobs
-            for entry in entries:
-                tar.add(entry, arcname=str(entry.relative_to(subsystem_dir)), recursive=False)
+def safe_cache_component(value: str) -> str:
+    safe = "".join(
+        c if c.isalnum() or c in "._-" else "_" for c in str(value)
+    ).strip("._-")
+    return safe or "unknown"
 
-        with open(tar_path, "rb") as f:
-            resp = httpx.post(
-                f"{ENV_URL}/data/populate",
-                files={"archive": (tar_path.name, f.read(), "application/gzip")},
-                params={"subsystem": subsystem},
-                timeout=600.0,
+
+def cache_dir_for(kind: str, key: str) -> Path:
+    return archive_cache_root() / kind / safe_cache_component(key)
+
+
+@contextmanager
+def cache_lock(cache_dir: Path):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cache_dir / "manifest.lock"
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def read_archive_manifest(cache_dir: Path) -> list[dict] | None:
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    try:
+        with manifest_path.open() as f:
+            manifest = json.load(f)
+        archives = []
+        for item in manifest.get("archives", []):
+            subsystem = item.get("subsystem")
+            archive_name = item.get("archive")
+            if not isinstance(subsystem, str) or not isinstance(archive_name, str):
+                return None
+            archive_path = cache_dir / archive_name
+            if not archive_path.exists():
+                return None
+            archives.append(
+                {
+                    "subsystem": subsystem,
+                    "path": archive_path,
+                    "objects": int(item.get("objects", 0)),
+                    "files": int(item.get("files", 0)),
+                    "bytes": int(item.get("bytes", archive_path.stat().st_size)),
+                }
             )
-            if resp.status_code != 200:
-                log(f"ERROR: Failed to populate {label} {subsystem}: {resp.text}")
-                sys.exit(1)
-            log(f"  {subsystem}: {resp.json()}")
+        return archives
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def write_archive_manifest(cache_dir: Path, archives: list[dict]) -> None:
+    manifest_path = cache_dir / "manifest.json"
+    manifest = {
+        "archives": [
+            {
+                "subsystem": archive["subsystem"],
+                "archive": Path(archive["path"]).name,
+                "objects": archive["objects"],
+                "files": archive["files"],
+                "bytes": archive["bytes"],
+            }
+            for archive in archives
+        ]
+    }
+    tmp_path = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
+    with tmp_path.open("w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, manifest_path)
+
+
+def create_subsystem_archive(
+    subsystem_dir: Path,
+    archive_path: Path,
+    label: str,
+    subsystem: str,
+) -> dict | None:
+    if not subsystem_dir.exists():
+        return None
+
+    entries = list(subsystem_dir.rglob("*"))
+    if not entries:
+        return None
+
+    file_count = sum(1 for p in entries if p.is_file())
+    log(
+        f"  Preparing cached {label} {subsystem} "
+        f"({file_count} files, {len(entries) - file_count} directories)..."
+    )
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = archive_path.with_name(f".{archive_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tarfile.open(tmp_path, "w:gz", compresslevel=1) as tar:
+            tar.dereference = True
+            for entry in entries:
+                tar.add(
+                    entry,
+                    arcname=str(entry.relative_to(subsystem_dir)),
+                    recursive=False,
+                )
+        os.replace(tmp_path, archive_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    return {
+        "subsystem": subsystem,
+        "path": archive_path,
+        "objects": len(entries),
+        "files": file_count,
+        "bytes": archive_path.stat().st_size,
+    }
+
+
+def prepare_archives_from_root(root: Path, cache_dir: Path, label: str) -> list[dict]:
+    archives = []
+    for subsystem in SUBSYSTEMS:
+        archive = create_subsystem_archive(
+            root / subsystem,
+            cache_dir / f"{subsystem}.tar.gz",
+            label,
+            subsystem,
+        )
+        if archive is not None:
+            archives.append(archive)
+    write_archive_manifest(cache_dir, archives)
+    return archives
+
+
+def cached_world_archives(world_id: str, zip_path: Path) -> list[dict]:
+    cache_dir = cache_dir_for("worlds", world_id)
+    with cache_lock(cache_dir):
+        cached = read_archive_manifest(cache_dir)
+        if cached is not None:
+            log(f"Using cached world archives for {world_id}: {cache_dir}")
+            return cached
+
+        log(f"Creating world archive cache for {world_id}: {cache_dir}")
+        with tempfile.TemporaryDirectory() as tmp:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmp)
+            return prepare_archives_from_root(Path(tmp), cache_dir, "world")
+
+
+def cached_task_archives(task_id: str) -> list[dict]:
+    cache_dir = cache_dir_for("tasks", task_id)
+    with cache_lock(cache_dir):
+        cached = read_archive_manifest(cache_dir)
+        if cached is not None:
+            log(f"Using cached task archives for {task_id}: {cache_dir}")
+            return cached
+
+        task_prefix = f"task_files/{task_id}"
+        log(f"Creating task archive cache for {task_id}: {cache_dir}")
+        snapshot_dir = snapshot_download(
+            HF_DATASET, repo_type="dataset", allow_patterns=[f"{task_prefix}/**"]
+        )
+        task_dir = Path(snapshot_dir) / task_prefix
+        if not task_dir.exists():
+            write_archive_manifest(cache_dir, [])
+            return []
+        return prepare_archives_from_root(task_dir, cache_dir, "task")
+
+
+def populate_archive(archive: dict, label: str) -> None:
+    subsystem = archive["subsystem"]
+    tar_path = Path(archive["path"])
+    file_count = archive["files"]
+    byte_count = archive["bytes"]
+    log(
+        f"  Populating {label} {subsystem} from cache "
+        f"({file_count} files, {byte_count} bytes)..."
+    )
+    with tar_path.open("rb") as f:
+        resp = httpx.post(
+            f"{ENV_URL}/data/populate",
+            files={"archive": (tar_path.name, f, "application/gzip")},
+            params={"subsystem": subsystem},
+            timeout=600.0,
+        )
+    if resp.status_code != 200:
+        log(f"ERROR: Failed to populate {label} {subsystem}: {resp.text}")
+        sys.exit(1)
+    log(f"  {subsystem}: {resp.json()}")
+
+
+def populate_archives(archives: list[dict], label: str) -> None:
+    if not archives:
+        log(f"  No {label} archives to populate")
+        return
+    for archive in archives:
+        populate_archive(archive, label)
+
+
+def copy_or_link(src: Path, dst: Path) -> None:
+    """Materialize src at dst without preserving HF cache symlinks."""
+    src = src.resolve(strict=True)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if dst.exists() and not dst.is_symlink():
+        try:
+            if dst.stat().st_size == src.stat().st_size:
+                return
+        except OSError:
+            pass
+
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+
+    tmp_path = dst.with_name(f".{dst.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        try:
+            os.link(src, tmp_path)
+        except OSError:
+            shutil.copy2(src, tmp_path)
+        os.replace(tmp_path, dst)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    if dst.is_symlink() or not dst.exists():
+        log(f"ERROR: Failed to materialize snapshot zip: {dst}")
+        sys.exit(1)
 
 
 def wait_for_health(url: str, timeout: int = 480) -> bool:
@@ -139,6 +357,49 @@ def start_environment():
     log("Environment started")
 
 
+def reset_environment_state():
+    """Clear mutable state in an already-running environment."""
+    log("Resetting environment state...")
+    try:
+        resp = httpx.post(f"{ENV_URL}/data/reset", timeout=600.0)
+    except httpx.RequestError as e:
+        log(f"ERROR: Failed to reset environment state: {e}")
+        sys.exit(1)
+
+    if resp.status_code != 200:
+        log(f"ERROR: Failed to reset environment state: {resp.text}")
+        sys.exit(1)
+    log(f"Environment state reset: {resp.json()}")
+
+
+def prepare_environment():
+    """Start a fresh environment or reset an existing reusable worker."""
+    if not env_flag("REUSE_ENVIRONMENT"):
+        start_environment()
+        return
+
+    log("Reusing existing environment container")
+    log("Waiting for environment to be healthy...")
+    if not wait_for_health(ENV_URL):
+        subprocess.run(["docker", "compose", "logs"], cwd=ENVIRONMENT_DIR)
+        log("ERROR: Reusable environment is not healthy")
+        sys.exit(1)
+    reset_environment_state()
+
+
+def configure_mcp_servers():
+    """Configure MCP servers using the all-servers config."""
+    log("Configuring MCP servers...")
+    with open(EXAMPLE_DIR / "mcp_config_all_oss_servers.json") as f:
+        mcp_config = json.load(f)
+    server_names = list(mcp_config["mcpServers"].keys())
+    log(f"  Servers: {server_names}")
+
+    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=1200.0)
+    resp.raise_for_status()
+    log("MCP servers configured")
+
+
 def tar_gz_to_zip(tar_gz_path: Path) -> Path:
     """Convert tar.gz to zip for grading."""
     stem = tar_gz_path.stem
@@ -153,6 +414,152 @@ def tar_gz_to_zip(tar_gz_path: Path) -> Path:
                     if f is not None:
                         zf.writestr(member.name, f.read())
     return zip_path
+
+
+def save_final_snapshot(output_dir: Path) -> Path:
+    """Save final snapshot as a grading-compatible zip."""
+    if env_flag("DIRECT_ZIP_SNAPSHOT", True):
+        compression = os.environ.get("SNAPSHOT_ZIP_COMPRESSION", "stored")
+        final_zip = output_dir / "final_snapshot.zip"
+        log(f"Saving final snapshot as zip (compression={compression})...")
+        with httpx.stream(
+            "POST",
+            f"{ENV_URL}/data/snapshot/zip",
+            params={"compression": compression},
+            timeout=600.0,
+        ) as resp:
+            if resp.status_code != 404:
+                resp.raise_for_status()
+                with final_zip.open("wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+                return final_zip
+            log("Zip snapshot endpoint unavailable; falling back to tar.gz snapshot")
+
+    log("Saving final snapshot as tar.gz, then converting to zip...")
+    with httpx.stream("POST", f"{ENV_URL}/data/snapshot", timeout=600.0) as resp:
+        resp.raise_for_status()
+        final_tar_gz = output_dir / "final_snapshot.tar.gz"
+        with final_tar_gz.open("wb") as f:
+            for chunk in resp.iter_bytes(chunk_size=65536):
+                f.write(chunk)
+
+    return tar_gz_to_zip(final_tar_gz)
+
+
+def download_world_snapshot(world_id: str, output_dir: Path) -> tuple[Path, Path]:
+    log(f"Downloading world snapshot: {world_id}")
+    zip_path = Path(
+        hf_hub_download(
+            HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
+        )
+    )
+    world_zip = output_dir / f"{world_id}.zip"
+    copy_or_link(zip_path, world_zip)
+    return zip_path, world_zip
+
+
+def read_agent_status(trajectory_file: Path) -> str | None:
+    if not trajectory_file.exists():
+        return None
+    try:
+        with trajectory_file.open() as f:
+            trajectory = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"WARNING: Could not read existing trajectory: {e}")
+        return None
+
+    agent_status = trajectory.get("status")
+    log(f"Agent status: {agent_status}")
+    return agent_status
+
+
+def write_verifiers(task: dict, world_id: str, output_dir: Path) -> Path:
+    verifiers = [
+        {
+            "verifier_id": c["verifier_id"],
+            "verifier_version": 1,
+            "world_id": world_id,
+            "task_id": task["task_id"],
+            "eval_config_id": "ec_output_llm",
+            "verifier_values": {
+                "criteria": c["criteria"],
+                "is_primary_objective": i == 0,
+            },
+            "verifier_index": i,
+            "verifier_dependencies": None,
+        }
+        for i, c in enumerate(task.get("rubric", []))
+    ]
+    verifiers_file = output_dir / "verifiers.json"
+    with verifiers_file.open("w") as f:
+        json.dump(verifiers, f, indent=2)
+    return verifiers_file
+
+
+def run_grading(
+    task: dict,
+    world_id: str,
+    output_dir: Path,
+    world_zip: Path,
+    final_zip: Path,
+    trajectory_file: Path,
+    trajectory_id: str,
+    grading_run_id: str,
+) -> None:
+    log("Running grading...")
+    verifiers_file = write_verifiers(task, world_id, output_dir)
+    grades_file = output_dir / "grades.json"
+
+    grading_cmd = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "runner.main",
+        "--grading-run-id",
+        grading_run_id,
+        "--trajectory-id",
+        trajectory_id,
+        "--initial-snapshot",
+        str(world_zip),
+        "--final-snapshot",
+        str(final_zip),
+        "--trajectory",
+        str(trajectory_file),
+        "--grading-settings",
+        str(EXAMPLE_DIR / "grading_settings.json"),
+        "--verifiers",
+        str(verifiers_file),
+        "--eval-configs",
+        str(EXAMPLE_DIR / "eval_configs.json"),
+        "--scoring-config",
+        str(EXAMPLE_DIR / "scoring_config.json"),
+        "--output",
+        str(grades_file),
+    ]
+
+    result = subprocess.run(grading_cmd, cwd=GRADING_DIR)
+    if result.returncode != 0:
+        log(f"WARNING: Grading exited with code {result.returncode}")
+
+    if grades_file.exists():
+        with grades_file.open() as f:
+            grades = json.load(f)
+        log("=" * 60)
+        log("GRADING RESULTS")
+        log("=" * 60)
+        log(f"Status: {grades.get('grading_run_status')}")
+        log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
+        for vr in grades.get("verifier_results", []):
+            log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
+
+
+def log_done(output_dir: Path) -> None:
+    log("=" * 60)
+    log("DONE")
+    log(f"Output: {output_dir}")
+    log("=" * 60)
 
 
 def main():
@@ -199,6 +606,9 @@ def main():
     if trial_id:
         output_dir = output_dir / trial_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    trajectory_file = output_dir / "trajectory.json"
+    grades_file = output_dir / "grades.json"
+    existing_final_zip = output_dir / "final_snapshot.zip"
 
     log("=" * 60)
     log(f"Task: {task['task_name']}")
@@ -207,44 +617,50 @@ def main():
     log(f"Prompt: {task['prompt'][:100]}...")
     log("=" * 60)
 
-    start_environment()
+    if grades_file.exists() and grades_file.stat().st_size > 0:
+        log(f"Grades already exist: {grades_file}")
+        log_done(output_dir)
+        return
 
-    # Download and extract world snapshot
-    log(f"Downloading world snapshot: {world_id}")
-    zip_path = hf_hub_download(
-        HF_DATASET, f"world_files_zipped/{world_id}.zip", repo_type="dataset"
-    )
-    world_zip = output_dir / f"{world_id}.zip"
-    shutil.copy(zip_path, world_zip)
+    agent_status = read_agent_status(trajectory_file)
+    if (
+        agent_status == "completed"
+        and existing_final_zip.exists()
+        and existing_final_zip.stat().st_size > 0
+    ):
+        log("Existing completed trajectory and final snapshot found; running grading only")
+        _, world_zip = download_world_snapshot(world_id, output_dir)
+        run_grading(
+            task,
+            world_id,
+            output_dir,
+            world_zip,
+            existing_final_zip,
+            trajectory_file,
+            trajectory_id,
+            grading_run_id,
+        )
+        log_done(output_dir)
+        return
 
-    # Populate world data, then overlay per-task files (order matters)
+    prepare_environment()
+
+    # Download world snapshot and populate cached subsystem archives.
+    zip_path, world_zip = download_world_snapshot(world_id, output_dir)
+
+    # Populate world data, then overlay per-task files (order matters).
     log("Populating environment with world snapshot...")
-    with tempfile.TemporaryDirectory() as tmp:
-        with zipfile.ZipFile(world_zip, "r") as zf:
-            zf.extractall(tmp)
-        populate_subsystems(Path(tmp), output_dir, "world")
+    populate_archives(cached_world_archives(world_id, zip_path), "world")
 
     if task.get("task_input_files"):
-        task_prefix = f"task_files/{task['task_id']}"
-        log(f"Downloading task input files: {task['task_id']}")
-        snapshot_dir = snapshot_download(
-            HF_DATASET, repo_type="dataset", allow_patterns=[f"{task_prefix}/**"]
-        )
-        task_dir = Path(snapshot_dir) / task_prefix
-        if task_dir.exists():
-            populate_subsystems(task_dir, output_dir, "task")
-        else:
-            log(f"  No task files found at {task_prefix}")
+        task_id = task["task_id"]
+        log(f"Populating task input files: {task_id}")
+        populate_archives(cached_task_archives(task_id), "task")
 
-    # Configure MCP servers using the all-servers config
-    log("Configuring MCP servers...")
-    with open(EXAMPLE_DIR / "mcp_config_all_oss_servers.json") as f:
-        mcp_config = json.load(f)
-    log(f"  Servers: {list(mcp_config['mcpServers'].keys())}")
-
-    resp = httpx.post(f"{ENV_URL}/apps", json=mcp_config, timeout=1200.0)
-    resp.raise_for_status()
-    log("MCP servers configured")
+    if env_flag("SKIP_MCP_CONFIG"):
+        log("Skipping MCP server configuration (already configured for this worker)")
+    else:
+        configure_mcp_servers()
 
     # Generate initial messages from HuggingFace task prompt
     # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
@@ -291,8 +707,6 @@ Don't over-explain. Be concise but show your thinking.
     with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
         orchestrator_config = json.load(f)
 
-    trajectory_file = output_dir / "trajectory.json"
-
     # Run agent
     log("Running agent...")
     agent_cmd = [
@@ -326,100 +740,28 @@ Don't over-explain. Be concise but show your thinking.
     if result.returncode != 0:
         log(f"WARNING: Agent exited with code {result.returncode}")
 
-    agent_status = None
-    if trajectory_file.exists():
-        with open(trajectory_file) as f:
-            trajectory = json.load(f)
-            agent_status = trajectory.get("status")
-            log(f"Agent status: {agent_status}")
+    agent_status = read_agent_status(trajectory_file)
 
     # Save final snapshot
-    log("Saving final snapshot...")
-    with httpx.stream("POST", f"{ENV_URL}/data/snapshot") as resp:
-        resp.raise_for_status()
-        final_tar_gz = output_dir / "final_snapshot.tar.gz"
-        with open(final_tar_gz, "wb") as f:
-            for chunk in resp.iter_bytes(chunk_size=65536):
-                f.write(chunk)
-
-    final_zip = tar_gz_to_zip(final_tar_gz)
+    final_zip = save_final_snapshot(output_dir)
     log(f"Saved: {final_zip}")
 
     # Run grading if agent completed
     if agent_status != "completed":
         log(f"Skipping grading (agent status: {agent_status})")
     else:
-        log("Running grading...")
-
-        # Generate verifiers from HuggingFace rubric
-        verifiers = [
-            {
-                "verifier_id": c["verifier_id"],
-                "verifier_version": 1,
-                "world_id": world_id,
-                "task_id": task["task_id"],
-                "eval_config_id": "ec_output_llm",
-                "verifier_values": {
-                    "criteria": c["criteria"],
-                    "is_primary_objective": i == 0,
-                },
-                "verifier_index": i,
-                "verifier_dependencies": None,
-            }
-            for i, c in enumerate(task.get("rubric", []))
-        ]
-        with open(output_dir / "verifiers.json", "w") as f:
-            json.dump(verifiers, f, indent=2)
-
-        grades_file = output_dir / "grades.json"
-
-        grading_cmd = [
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "runner.main",
-            "--grading-run-id",
-            grading_run_id,
-            "--trajectory-id",
+        run_grading(
+            task,
+            world_id,
+            output_dir,
+            world_zip,
+            final_zip,
+            trajectory_file,
             trajectory_id,
-            "--initial-snapshot",
-            str(world_zip),
-            "--final-snapshot",
-            str(final_zip),
-            "--trajectory",
-            str(trajectory_file),
-            "--grading-settings",
-            str(EXAMPLE_DIR / "grading_settings.json"),
-            "--verifiers",
-            str(output_dir / "verifiers.json"),
-            "--eval-configs",
-            str(EXAMPLE_DIR / "eval_configs.json"),
-            "--scoring-config",
-            str(EXAMPLE_DIR / "scoring_config.json"),
-            "--output",
-            str(grades_file),
-        ]
+            grading_run_id,
+        )
 
-        result = subprocess.run(grading_cmd, cwd=GRADING_DIR)
-        if result.returncode != 0:
-            log(f"WARNING: Grading exited with code {result.returncode}")
-
-        if grades_file.exists():
-            with open(grades_file) as f:
-                grades = json.load(f)
-            log("=" * 60)
-            log("GRADING RESULTS")
-            log("=" * 60)
-            log(f"Status: {grades.get('grading_run_status')}")
-            log(f"Final Score: {grades.get('scoring_results', {}).get('final_score')}")
-            for vr in grades.get("verifier_results", []):
-                log(f"  - {vr.get('verifier_id')}: {vr.get('score')}")
-
-    log("=" * 60)
-    log("DONE")
-    log(f"Output: {output_dir}")
-    log("=" * 60)
+    log_done(output_dir)
 
 
 if __name__ == "__main__":

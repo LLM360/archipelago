@@ -10,6 +10,7 @@ import io
 import queue
 import tarfile
 import threading
+import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -527,6 +528,74 @@ class StreamingTarFile:
         # Verify no write errors occurred
         if self._write_error:
             raise RuntimeError("Error during tarfile creation") from self._write_error
+
+
+class UnseekableStreamingFile(StreamingTarFile):
+    """Streaming file variant that forces zipfile to use data descriptors."""
+
+    def tell(self) -> int:
+        raise OSError("Seek not supported")
+
+    def seek(self, pos: int, whence: int = 0) -> int:  # noqa: ARG002
+        raise OSError("Seek not supported")
+
+    def flush(self) -> None:
+        return None
+
+
+def _zip_compression(compression: str) -> tuple[int, int | None, str]:
+    normalized = compression.strip().lower()
+    if normalized in {"stored", "store", "none"}:
+        return zipfile.ZIP_STORED, None, "stored"
+    if normalized in {"deflated", "deflate"}:
+        return zipfile.ZIP_DEFLATED, 1, "deflated"
+    raise ValueError("compression must be stored or deflated")
+
+
+def create_zip_stream(
+    subsystems: list[str],
+    snapshot_id: str,
+    iter_paths_func: Callable[[str, str], Iterator[tuple[Path, str]]],
+    compression: str = "stored",
+) -> Iterator[bytes]:
+    """Create a zip archive and yield chunks as bytes."""
+    stream_file = UnseekableStreamingFile()
+    method, compresslevel, normalized = _zip_compression(compression)
+    kwargs = {"compression": method, "allowZip64": True}
+    if compresslevel is not None:
+        kwargs["compresslevel"] = compresslevel
+
+    def create_archive():
+        """Create zip archive, writing chunks to stream_file."""
+        try:
+            logger.debug(
+                f"Creating zip snapshot {snapshot_id} with {normalized} compression"
+            )
+            with zipfile.ZipFile(stream_file, "w", **kwargs) as zf:
+                for subsystem in subsystems:
+                    subsystem_path = f"/{subsystem}"
+                    logger.debug(
+                        f"Adding subsystem {subsystem!r} from {subsystem_path} to zip archive"
+                    )
+                    file_count = 0
+                    for path, arcname in iter_paths_func(subsystem_path, subsystem):
+                        zf.write(path, arcname=arcname)
+                        file_count += 1
+                    logger.debug(
+                        f"Added {file_count} file(s) from subsystem {subsystem!r}"
+                    )
+        except Exception as e:
+            stream_file.set_error(e)
+            logger.error(
+                f"Error creating zip archive for snapshot {snapshot_id}: {repr(e)}"
+            )
+        finally:
+            stream_file.close()
+
+    archive_thread = threading.Thread(target=create_archive, daemon=True)
+    archive_thread.start()
+
+    yield from stream_file
 
 
 def create_tar_gz_stream(

@@ -31,10 +31,67 @@ from runner.utils.settings import get_settings
 from ..populate.main import run_lifecycle_hook
 from ..populate.models import LifecycleHook
 from .models import SnapshotFilesResult, SnapshotResult
-from .streaming import create_tar_gz_stream
+from .streaming import create_tar_gz_stream, create_zip_stream
 from .utils import generate_presigned_url, iter_paths, s3_stream_uploader
 
 settings = get_settings()
+
+
+def _snapshot_subsystems() -> list[str]:
+    return [settings.FILESYSTEM_SUBSYSTEM_NAME, settings.APPS_DATA_SUBSYSTEM_NAME]
+
+
+def _validate_zip_compression(compression: str) -> None:
+    normalized = compression.strip().lower()
+    if normalized not in {"stored", "store", "none", "deflated", "deflate"}:
+        raise HTTPException(
+            status_code=400, detail="compression must be stored or deflated"
+        )
+
+
+async def _run_pre_snapshot_hooks(
+    pre_snapshot_hooks: list[LifecycleHook] | None,
+) -> None:
+    if not pre_snapshot_hooks:
+        return
+    logger.info(f"Running {len(pre_snapshot_hooks)} pre-snapshot hook(s)")
+    try:
+        for hook in pre_snapshot_hooks:
+            await run_lifecycle_hook(hook)
+        logger.info("All pre-snapshot hooks completed")
+    except RuntimeError as e:
+        logger.error(f"Pre-snapshot hook failed: {repr(e)}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+async def handle_snapshot_zip(
+    pre_snapshot_hooks: list[LifecycleHook] | None = None,
+    compression: str = "stored",
+) -> tuple[Iterator[bytes], str]:
+    """Create a zip archive of all subsystems and stream it back."""
+    snapshot_id = f"snap_{uuid().hex}"
+    filename = f"{snapshot_id}.zip"
+    _validate_zip_compression(compression)
+    await _run_pre_snapshot_hooks(pre_snapshot_hooks)
+
+    subsystems = _snapshot_subsystems()
+    subsystem_list = ", ".join(subsystems)
+    logger.debug(
+        f"Starting zip snapshot stream {snapshot_id} for subsystems: {subsystem_list}"
+    )
+
+    try:
+        return create_zip_stream(
+            subsystems, snapshot_id, iter_paths, compression=compression
+        ), filename
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.error(f"Error creating zip snapshot {snapshot_id}: {repr(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create zip snapshot {snapshot_id}: {str(e)}",
+        ) from e
 
 
 async def handle_snapshot(
@@ -68,19 +125,10 @@ async def handle_snapshot(
     snapshot_id = f"snap_{uuid().hex}"
     filename = f"{snapshot_id}.tar.gz"
 
-    # Run pre-snapshot hooks (e.g., database dumps)
-    if pre_snapshot_hooks:
-        logger.info(f"Running {len(pre_snapshot_hooks)} pre-snapshot hook(s)")
-        try:
-            for hook in pre_snapshot_hooks:
-                await run_lifecycle_hook(hook)
-            logger.info("All pre-snapshot hooks completed")
-        except RuntimeError as e:
-            logger.error(f"Pre-snapshot hook failed: {repr(e)}")
-            raise HTTPException(status_code=500, detail=str(e)) from e
+    await _run_pre_snapshot_hooks(pre_snapshot_hooks)
 
     # Subsystems to snapshot
-    subsystems = [settings.FILESYSTEM_SUBSYSTEM_NAME, settings.APPS_DATA_SUBSYSTEM_NAME]
+    subsystems = _snapshot_subsystems()
 
     logger.debug(
         f"Starting snapshot stream {snapshot_id} for subsystems: {', '.join(subsystems)}"
@@ -131,16 +179,7 @@ async def handle_snapshot_s3(
 
     snapshot_id = f"snap_{uuid().hex}"
 
-    # 1. Run pre-snapshot hooks (e.g., database dumps)
-    if pre_snapshot_hooks:
-        logger.info(f"Running {len(pre_snapshot_hooks)} pre-snapshot hook(s)")
-        try:
-            for hook in pre_snapshot_hooks:
-                await run_lifecycle_hook(hook)
-            logger.info("All pre-snapshot hooks completed")
-        except RuntimeError as e:
-            logger.error(f"Pre-snapshot hook failed: {repr(e)}")
-            raise HTTPException(status_code=500, detail=str(e)) from e
+    await _run_pre_snapshot_hooks(pre_snapshot_hooks)
 
     object_key = f"{snapshot_id}.tar.gz"
 
@@ -153,7 +192,7 @@ async def handle_snapshot_s3(
     key += object_key
 
     # Subsystems to snapshot
-    subsystems = [settings.FILESYSTEM_SUBSYSTEM_NAME, settings.APPS_DATA_SUBSYSTEM_NAME]
+    subsystems = _snapshot_subsystems()
 
     logger.debug(
         f"Starting snapshot {snapshot_id} for subsystems: {', '.join(subsystems)}"

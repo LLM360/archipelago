@@ -19,6 +19,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="output_qwen397b", help="Output directory to score")
     parser.add_argument(
+        "--trial",
+        default="",
+        help="Restrict metrics to one trial, e.g. 0 or trial_0. Defaults to all trials.",
+    )
+    parser.add_argument(
         "--include-vision-tasks",
         action="store_true",
         help="Include tasks classified as vision-required. Defaults to AA text-only evaluation.",
@@ -41,6 +46,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def normalize_trial(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if value.isdigit():
+        return f"trial_{value}"
+    return value
+
+
 def include_trial(task_id: str, args: argparse.Namespace) -> bool:
     if not args.include_aa_excluded_worlds and task_id in AA_EXCLUDED_TASK_IDS:
         return False
@@ -56,7 +70,11 @@ def include_trial(task_id: str, args: argparse.Namespace) -> bool:
 args = parse_args()
 root = Path(args.output_dir)
 all_trials = sorted(root.glob("task_*/trial_*"))
-trials = [trial for trial in all_trials if include_trial(trial.parent.name, args)]
+selected_trial = normalize_trial(args.trial)
+trial_filtered = [
+    trial for trial in all_trials if not selected_trial or trial.name == selected_trial
+]
+trials = [trial for trial in trial_filtered if include_trial(trial.parent.name, args)]
 
 graded = 0
 passed = 0
@@ -76,6 +94,7 @@ for t in trials:
         passed += 1
 
 print(f"output_dir: {root}")
+print(f"trial: {selected_trial or 'all'}")
 if args.include_aa_excluded_worlds:
     aa_scope = "all dataset worlds"
 else:
@@ -88,7 +107,8 @@ elif args.semantic_text_only:
 else:
     print(f"task_filter: AA conservative text-only ({AA_CONSERVATIVE_TEXT_ONLY_TASK_COUNT} expected tasks)")
 
-print(f"trials_excluded_by_filter: {len(all_trials) - len(trials)}")
+print(f"trials_excluded_by_trial: {len(all_trials) - len(trial_filtered)}")
+print(f"trials_excluded_by_filter: {len(trial_filtered) - len(trials)}")
 print(f"passed: {passed}")
 print(f"graded: {graded}")
 print(f"total_attempted: {len(trials)}")

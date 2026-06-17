@@ -32,7 +32,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from text_only_tasks import (
@@ -77,11 +77,26 @@ class Stats:
     done: int = 0
     failed: int = 0
     skipped: int = 0
+    started: int = 0
     elapsed_sum: float = 0.0
+    started_at: float = field(default_factory=time.time)
+    completion_times: list[float] = field(default_factory=list)
+
+    @property
+    def attempted(self) -> int:
+        return self.done + self.failed
 
     @property
     def finished(self) -> int:
-        return self.done + self.failed + self.skipped
+        return self.attempted + self.skipped
+
+    @property
+    def running(self) -> int:
+        return max(self.started - self.attempted, 0)
+
+    @property
+    def queued(self) -> int:
+        return max(self.total - self.skipped - self.started, 0)
 
 
 def log(msg: str) -> None:
@@ -291,6 +306,96 @@ def prebuild_environment() -> None:
         raise SystemExit(f"docker compose build failed with exit code {result.returncode}")
 
 
+def wait_for_worker_health(spec: WorkerSpec, timeout: int = 480) -> bool:
+    import httpx
+
+    url = f"http://localhost:{spec.port}"
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            resp = httpx.get(f"{url}/health", timeout=5)
+            if resp.status_code == 200:
+                return True
+        except httpx.RequestError:
+            pass
+        time.sleep(1)
+    return False
+
+
+def start_worker_environment(spec: WorkerSpec, build: bool) -> None:
+    compose_up_cmd = ["docker", "compose", "up", "-d"]
+    compose_up_cmd.append("--build" if build else "--no-build")
+    result = subprocess.run(
+        compose_up_cmd,
+        cwd=ENVIRONMENT_DIR,
+        env=compose_env(spec),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode != 0:
+        tail = result.stdout.strip()[-1200:]
+        raise RuntimeError(f"docker compose up failed with exit code {result.returncode}: {tail}")
+
+    if wait_for_worker_health(spec):
+        return
+
+    logs = subprocess.run(
+        ["docker", "compose", "logs"],
+        cwd=ENVIRONMENT_DIR,
+        env=compose_env(spec),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    tail = logs.stdout.strip()[-2000:]
+    raise RuntimeError(f"environment failed to become healthy: {tail}")
+
+
+def configure_worker_mcp(spec: WorkerSpec, mcp_config: dict) -> float:
+    import httpx
+
+    url = f"http://localhost:{spec.port}"
+    start = time.time()
+    resp = httpx.post(f"{url}/apps", json=mcp_config, timeout=1200.0)
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"MCP configuration failed: {e.response.text[:1200]}") from e
+    return time.time() - start
+
+
+def prepare_reusable_worker(spec: WorkerSpec, build: bool, mcp_config: dict) -> float:
+    start_worker_environment(spec, build=build)
+    return configure_worker_mcp(spec, mcp_config)
+
+
+def prepare_reusable_worker_environments(worker_specs: list[WorkerSpec], args: argparse.Namespace) -> None:
+    with open(EXAMPLE_DIR / "mcp_config_all_oss_servers.json") as f:
+        mcp_config = json.load(f)
+
+    server_names = list(mcp_config["mcpServers"].keys())
+    setup_workers = min(args.setup_concurrency, len(worker_specs))
+    log(
+        f"Starting and configuring {len(worker_specs)} reusable worker environment(s) "
+        f"with setup_concurrency={setup_workers}..."
+    )
+    log(f"  MCP servers: {server_names}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=setup_workers) as executor:
+        future_to_spec = {
+            executor.submit(prepare_reusable_worker, spec, args.build_per_run, mcp_config): spec
+            for spec in worker_specs
+        }
+        for future in concurrent.futures.as_completed(future_to_spec):
+            spec = future_to_spec[future]
+            try:
+                mcp_elapsed = future.result()
+            except Exception as e:
+                raise SystemExit(f"w{spec.worker_id} failed reusable worker setup: {e}") from e
+            log(f"  w{spec.worker_id}: ready on http://localhost:{spec.port} (MCP {mcp_elapsed:.1f}s)")
+
+
 def port_is_available(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -376,7 +481,12 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
     env["COMPOSE_PROJECT_NAME"] = spec.project_name
     env["ENV_PORT"] = str(spec.port)
     env["ENV_URL"] = f"http://localhost:{spec.port}"
-    env["ENVIRONMENT_BUILD"] = "1" if args.build_per_run else "0"
+    if args.restart_env_per_task:
+        env["ENVIRONMENT_BUILD"] = "1" if args.build_per_run else "0"
+    else:
+        env["ENVIRONMENT_BUILD"] = "0"
+        env["REUSE_ENVIRONMENT"] = "1"
+        env["SKIP_MCP_CONFIG"] = "1"
     env["OUTPUT_DIR"] = str(args.output_root)
 
     cmd = [sys.executable, str(EXAMPLE_DIR / "main.py"), item.task_id]
@@ -385,7 +495,14 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
         rc, elapsed, timed_out = run_process(cmd, env, EXAMPLE_DIR, args.task_timeout, None)
     else:
         assert log_path is not None
-        with log_path.open("w") as f:
+        log_mode = "a" if log_path.exists() and log_path.stat().st_size > 0 else "w"
+        with log_path.open(log_mode) as f:
+            if log_mode == "a":
+                f.write(
+                    "\n\n"
+                    + "=" * 80
+                    + f"\nresume_at={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
             f.write(
                 f"task_id={item.task_id}\n"
                 f"trial_id={item.trial_id}\n"
@@ -401,14 +518,47 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
     return rc, elapsed, timed_out, log_path
 
 
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "pending"
+    seconds = max(seconds, 0.0)
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def completion_rate(stats: Stats, workers: int) -> tuple[float, str]:
+    attempted = stats.attempted
+    elapsed_wall = max(time.time() - stats.started_at, 1.0)
+    overall_rate = attempted / elapsed_wall if attempted else 0.0
+
+    window_size = min(max(workers * 2, 8), 40)
+    window = stats.completion_times[-window_size:]
+    min_recent = min(max(workers, 4), 10)
+    if len(window) >= min_recent:
+        span = max(window[-1] - window[0], 1.0)
+        recent_rate = (len(window) - 1) / span
+        if recent_rate > 0:
+            return recent_rate, "recent"
+
+    return overall_rate, "overall"
+
+
 def progress_line(stats: Stats, workers: int) -> str:
-    attempted = stats.done + stats.failed
+    attempted = stats.attempted
     avg = stats.elapsed_sum / attempted if attempted else 0.0
     remaining = max(stats.total - stats.finished, 0)
-    eta_seconds = (remaining * avg / max(workers, 1)) if attempted else 0.0
+    rate, rate_source = completion_rate(stats, workers)
+    eta_seconds = remaining / rate if rate > 0 else None
+    elapsed_wall = time.time() - stats.started_at
+    throughput = rate * 3600
     return (
         f"progress: done={stats.done} failed={stats.failed} skipped={stats.skipped} "
-        f"({stats.finished}/{stats.total}) | avg={avg:.0f}s/run | ETA={eta_seconds / 3600:.1f}h"
+        f"running={stats.running} queued={stats.queued} ({stats.finished}/{stats.total}) | "
+        f"avg_run={avg:.0f}s | throughput={throughput:.1f}/h {rate_source} | "
+        f"elapsed={format_duration(elapsed_wall)} | ETA={format_duration(eta_seconds)}"
     )
 
 
@@ -431,10 +581,11 @@ def worker_loop(
                 with stats_lock:
                     stats.skipped += 1
                     log(f"[w{spec.worker_id}] SKIP already graded: {item.task_id} {item.trial_id}")
-                    log(progress_line(stats, args.workers))
+                    log(progress_line(stats, args.active_workers))
                 continue
 
             with stats_lock:
+                stats.started += 1
                 log(
                     f"[w{spec.worker_id} port={spec.port}] "
                     f"({item.index}/{stats.total}) RUN: {item.task_id} {item.trial_id} - "
@@ -447,6 +598,9 @@ def worker_loop(
 
             with stats_lock:
                 stats.elapsed_sum += elapsed
+                stats.completion_times.append(time.time())
+                if len(stats.completion_times) > 200:
+                    del stats.completion_times[:-200]
                 if succeeded:
                     stats.done += 1
                     status = "DONE"
@@ -455,7 +609,7 @@ def worker_loop(
                     status = "TIMEOUT" if timed_out else "FAILED"
                 suffix = f" log={log_path}" if log_path else ""
                 log(f"[w{spec.worker_id}] {status}: {item.task_id} {item.trial_id} rc={rc} elapsed={elapsed:.0f}s{suffix}")
-                log(progress_line(stats, args.workers))
+                log(progress_line(stats, args.active_workers))
         finally:
             work_queue.task_done()
 
@@ -472,7 +626,7 @@ def parse_args() -> argparse.Namespace:
         description="Run HuggingFace benchmark tasks in parallel with isolated Docker Compose workers.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--workers", type=positive_int, default=8, help="Number of parallel environment workers")
+    parser.add_argument("--workers", type=positive_int, default=32, help="Number of parallel environment workers")
     parser.add_argument("--base-port", type=int, default=9090, help="First host port; workers use base-port + worker_id")
     parser.add_argument("--project-prefix", default="archipelago_bench", help="Compose project prefix for worker containers")
     parser.add_argument("--trials", type=positive_int, default=1, help="Number of trials per task")
@@ -496,7 +650,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-only", action="store_true", help="Only print resume stats; do not run Docker or tasks")
     parser.add_argument("--dry-run", action="store_true", help="Print the selected work without running Docker or tasks")
     parser.add_argument("--no-prebuild", action="store_true", help="Skip the initial docker compose build")
-    parser.add_argument("--build-per-run", action="store_true", help="Let main.py build on every task, matching the old behavior")
+    parser.add_argument("--build-per-run", action="store_true", help="Build during task startup in restart mode, or during worker startup in reuse mode")
+    parser.add_argument("--restart-env-per-task", action="store_true", help="Restart Docker and reconfigure MCP for every task instead of reusing one environment per worker")
+    parser.add_argument("--setup-concurrency", type=positive_int, default=8, help="Max reusable worker environments to start/configure at the same time")
     parser.add_argument("--skip-start-cleanup", action="store_true", help="Do not run docker compose down for worker projects before starting")
     parser.add_argument("--keep-env-running", action="store_true", help="Leave worker environments running at the end")
     parser.add_argument("--skip-port-check", action="store_true", help="Do not check whether worker ports are free before starting")
@@ -546,7 +702,7 @@ def main() -> None:
 
     require_modules([("httpx", "httpx")])
 
-    worker_specs = [
+    all_worker_specs = [
         WorkerSpec(
             worker_id=i,
             project_name=f"{args.project_prefix}_w{i}",
@@ -555,6 +711,12 @@ def main() -> None:
         for i in range(args.workers)
     ]
 
+    args.active_workers = min(args.workers, len(pending_runs))
+    if args.active_workers < args.workers:
+        log(f"Using {args.active_workers} active worker(s) for {len(pending_runs)} pending run(s)")
+
+    worker_specs = all_worker_specs[: args.active_workers]
+
     log("Workers:")
     for spec in worker_specs:
         log(f"  w{spec.worker_id}: project={spec.project_name} ENV_URL=http://localhost:{spec.port}")
@@ -562,7 +724,7 @@ def main() -> None:
     ensure_environment_env_file()
 
     if not args.skip_start_cleanup:
-        cleanup_worker_projects(worker_specs, "Cleaning worker Compose projects before start...")
+        cleanup_worker_projects(all_worker_specs, "Cleaning worker Compose projects before start...")
 
     if not args.skip_port_check:
         check_ports(worker_specs)
@@ -570,17 +732,24 @@ def main() -> None:
     if not args.no_prebuild:
         prebuild_environment()
 
-    work_queue: queue.Queue[RunItem] = queue.Queue()
-    for item in pending_runs:
-        work_queue.put(item)
-
     stats = Stats(total=len(runs), skipped=already_graded)
     stats_lock = threading.Lock()
     stop_event = threading.Event()
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+    executor: concurrent.futures.ThreadPoolExecutor | None = None
     futures: list[concurrent.futures.Future] = []
+
     try:
+        if args.restart_env_per_task:
+            log("Worker environment reuse disabled; each task will restart Docker and configure MCP.")
+        else:
+            prepare_reusable_worker_environments(worker_specs, args)
+
+        stats.started_at = time.time()
+        work_queue: queue.Queue[RunItem] = queue.Queue()
+        for item in pending_runs:
+            work_queue.put(item)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.active_workers)
         futures = [
             executor.submit(worker_loop, spec, work_queue, stats, stats_lock, args, stop_event)
             for spec in worker_specs
@@ -599,7 +768,8 @@ def main() -> None:
         stop_active_processes()
         raise
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         if not args.keep_env_running:
             cleanup_worker_projects(worker_specs, "Cleaning worker Compose projects after run...")
 
