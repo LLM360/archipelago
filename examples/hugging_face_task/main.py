@@ -52,6 +52,24 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def project_python_cmd(project_dir: Path, override_env: str) -> list[str]:
+    override = os.environ.get(override_env)
+    if override:
+        return [override]
+
+    venv_python = project_dir / ".venv" / "bin" / "python"
+    if venv_python.is_file() and os.access(venv_python, os.X_OK):
+        return [str(venv_python)]
+
+    if shutil.which("uv"):
+        return ["uv", "run", "python"]
+
+    raise FileNotFoundError(
+        f"Could not find {venv_python} or uv. Set {override_env} to the "
+        f"Python executable for {project_dir}."
+    )
+
+
 def resolve_output_root() -> Path:
     output_dir = os.environ.get("OUTPUT_DIR")
     if not output_dir:
@@ -512,9 +530,7 @@ def run_grading(
     grades_file = output_dir / "grades.json"
 
     grading_cmd = [
-        "uv",
-        "run",
-        "python",
+        *project_python_cmd(GRADING_DIR, "GRADING_PYTHON"),
         "-m",
         "runner.main",
         "--grading-run-id",
@@ -710,9 +726,7 @@ Don't over-explain. Be concise but show your thinking.
     # Run agent
     log("Running agent...")
     agent_cmd = [
-        "uv",
-        "run",
-        "python",
+        *project_python_cmd(AGENTS_DIR, "AGENTS_PYTHON"),
         "-m",
         "runner.main",
         "--trajectory-id",
