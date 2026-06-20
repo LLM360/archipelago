@@ -1,7 +1,7 @@
 {
-  "model": "openai/k2v3-8b-stage4-final",
+  "model": "openai/model-name",
   "extra_args": {
-    "api_base": "http://localhost:8567/v1",
+    "api_base": "http://127.0.0.1:26462/v1",
     "api_key": "dummy"
   }
 }

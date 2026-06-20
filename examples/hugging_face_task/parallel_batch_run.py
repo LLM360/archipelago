@@ -13,6 +13,7 @@ Examples from the repository root:
     agents/.venv/bin/python examples/hugging_face_task/parallel_batch_run.py --workers 2 --trials 1
     agents/.venv/bin/python examples/hugging_face_task/parallel_batch_run.py --workers 4 --base-port 8080 --trials 3
     agents/.venv/bin/python examples/hugging_face_task/parallel_batch_run.py --workers 3 --exclude-task-ids task_a,task_b
+    agents/.venv/bin/python examples/hugging_face_task/parallel_batch_run.py --workers 4 --no-preserve-thinking
     agents/.venv/bin/python examples/hugging_face_task/parallel_batch_run.py --summary-only --trials 1
 """
 
@@ -488,6 +489,7 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
         env["REUSE_ENVIRONMENT"] = "1"
         env["SKIP_MCP_CONFIG"] = "1"
     env["OUTPUT_DIR"] = str(args.output_root)
+    env["PRESERVE_THINKING"] = "1" if args.preserve_thinking else "0"
 
     cmd = [sys.executable, str(EXAMPLE_DIR / "main.py"), item.task_id]
 
@@ -509,6 +511,7 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
                 f"worker={spec.worker_id}\n"
                 f"project={spec.project_name}\n"
                 f"port={spec.port}\n"
+                f"preserve_thinking={args.preserve_thinking}\n"
                 f"cmd={' '.join(cmd)}\n\n"
             )
             f.flush()
@@ -657,7 +660,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-env-running", action="store_true", help="Leave worker environments running at the end")
     parser.add_argument("--skip-port-check", action="store_true", help="Do not check whether worker ports are free before starting")
     parser.add_argument("--stream-logs", action="store_true", help="Stream child task logs instead of writing per-run run.log files")
+    thinking_group = parser.add_mutually_exclusive_group()
+    thinking_group.add_argument(
+        "--preserve-thinking",
+        "--preserved-thinking",
+        dest="preserve_thinking",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Preserve/fill assistant reasoning_content when replaying message history (default)",
+    )
+    thinking_group.add_argument(
+        "--no-preserve-thinking",
+        dest="preserve_thinking",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Disable assistant reasoning_content preservation",
+    )
     args = parser.parse_args()
+    if not hasattr(args, "preserve_thinking"):
+        args.preserve_thinking = True
 
     if args.base_port < 1 or args.base_port + args.workers - 1 > 65535:
         raise SystemExit("Invalid --base-port/--workers combination; ports must be in 1..65535")

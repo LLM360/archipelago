@@ -38,13 +38,83 @@ from .tools import (
 )
 
 
+def _ensure_assistant_reasoning_content(message: LitellmAnyMessage) -> None:
+    """Ensure assistant messages always include reasoning_content."""
+    if isinstance(message, dict):
+        if (
+            message.get("role") == "assistant"
+            and message.get("reasoning_content") is None
+        ):
+            message["reasoning_content"] = " "
+        return
+
+    if (
+        getattr(message, "role", None) == "assistant"
+        and getattr(message, "reasoning_content", None) is None
+    ):
+        setattr(message, "reasoning_content", "")
+
+
+def _ensure_messages_reasoning_content(messages: list[LitellmAnyMessage]) -> None:
+    for message in messages:
+        _ensure_assistant_reasoning_content(message)
+
+
+def _message_to_dict(message: LitellmAnyMessage) -> dict[str, Any]:
+    if isinstance(message, dict):
+        data = dict(message)
+    else:
+        data = message.model_dump(mode="json", exclude_none=True)
+
+    _ensure_assistant_reasoning_content(data)
+    return data
+
+
+def _message_to_request_dict(message: LitellmAnyMessage) -> dict[str, Any]:
+    data = _message_to_dict(message)
+    provider_fields = data.pop("provider_specific_fields", None)
+    if isinstance(provider_fields, dict):
+        for key in (
+            "reasoning_content",
+            "reasoning",
+            "think",
+            "think_fast",
+            "think_faster",
+        ):
+            if provider_fields.get(key) is not None:
+                if data.get(key) is None or data.get(key) == "":
+                    data[key] = provider_fields[key]
+
+    _ensure_assistant_reasoning_content(data)
+    return data
+
+
+def _messages_to_dicts(messages: list[LitellmAnyMessage]) -> list[dict[str, Any]]:
+    return [_message_to_dict(message) for message in messages]
+
+
+def _messages_to_request_dicts(
+    messages: list[LitellmAnyMessage],
+) -> list[dict[str, Any]]:
+    return [_message_to_request_dict(message) for message in messages]
+
+
 class ReActAgent:
     """ReAct Toolbelt Agent with ReSum context management."""
 
     def __init__(self, run_input: AgentRunInput):
         self.trajectory_id: str = run_input.trajectory_id
         self.model: str = run_input.orchestrator_model
+
+        # Config
+        config = run_input.agent_config_values
+        self.preserve_thinking: bool = bool(
+            config.get("preserve_thinking", config.get("preserved_thinking", True))
+        )
+
         self.messages: list[LitellmAnyMessage] = list(run_input.initial_messages)
+        if self.preserve_thinking:
+            _ensure_messages_reasoning_content(self.messages)
 
         if run_input.mcp_gateway_url is None:
             raise ValueError("MCP gateway URL is required for react toolbelt agent")
@@ -56,8 +126,6 @@ class ReActAgent:
             )
         )
 
-        # Config
-        config = run_input.agent_config_values
         self.timeout: int = config.get("timeout", 10800)
         self.max_steps: int = config.get("max_steps", 250)
         self.tool_call_timeout: int = 60
@@ -117,11 +185,17 @@ class ReActAgent:
             except Exception as e:
                 logger.error(f"Summarization failed: {e}")
 
+        if self.preserve_thinking:
+            _ensure_messages_reasoning_content(self.messages)
+            request_messages = _messages_to_request_dicts(self.messages)
+        else:
+            request_messages = self.messages
+
         # Call LLM
         try:
             response: ModelResponse = await generate_response(
                 self.model,
-                self.messages,
+                request_messages,
                 self._get_tools(),
                 self.llm_response_timeout,
                 self.extra_args,
@@ -152,6 +226,8 @@ class ReActAgent:
             return
 
         response_message = LitellmOutputMessage.model_validate(choices[0].message)
+        if self.preserve_thinking:
+            _ensure_assistant_reasoning_content(response_message)
         tool_calls = getattr(response_message, "tool_calls", None)
         content = getattr(response_message, "content", None)
 
@@ -190,7 +266,10 @@ class ReActAgent:
             except Exception as e:
                 logger.error(f"Error getting finish reason: {e}")
 
-        self.messages.append(response_message)
+        if self.preserve_thinking:
+            self.messages.append(_message_to_dict(response_message))
+        else:
+            self.messages.append(response_message)
 
         if tool_calls:
             await self._handle_tool_calls(client, tool_calls)
@@ -388,7 +467,11 @@ class ReActAgent:
 
     def _build_output(self) -> AgentTrajectoryOutput:
         return AgentTrajectoryOutput(
-            messages=list(self.messages),
+            messages=(
+                _messages_to_dicts(self.messages)
+                if self.preserve_thinking
+                else list(self.messages)
+            ),
             status=self.status,
             time_elapsed=time.time() - self.start_time if self.start_time else 0,
             usage=self._usage_tracker.to_dict(),

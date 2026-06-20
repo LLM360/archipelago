@@ -226,3 +226,5 @@ Thumbs.db
 
 *.example
 *uv.lock
+
+*orchestrator_config.json.lock

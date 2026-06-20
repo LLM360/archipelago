@@ -72,6 +72,16 @@ AGENT_REGISTRY: dict[AgentConfigIds, AgentDefn] = {
                 min_value=1,
                 max_value=1000,
             ),
+            TaskFieldSchema(
+                field_id="preserve_thinking",
+                field_type=TaskFieldType.BOOLEAN,
+                label="Preserve Thinking",
+                description=(
+                    "Preserve assistant thinking fields when replaying message history. "
+                    "This keeps or fills reasoning_content for models that require it."
+                ),
+                default_value=True,
+            ),
         ],
     ),
 }

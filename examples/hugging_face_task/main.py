@@ -723,6 +723,34 @@ Don't over-explain. Be concise but show your thinking.
     with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
         orchestrator_config = json.load(f)
 
+    with open(EXAMPLE_DIR / "agent_config.json") as f:
+        agent_config = json.load(f)
+
+    preserve_thinking_env = os.environ.get("PRESERVE_THINKING")
+    preserved_thinking_env = os.environ.get("PRESERVED_THINKING")
+    if preserve_thinking_env is not None or preserved_thinking_env is not None:
+        preserve_thinking = (
+            env_flag("PRESERVE_THINKING")
+            if preserve_thinking_env is not None
+            else env_flag("PRESERVED_THINKING")
+        )
+        agent_config.setdefault("agent_config_values", {})[
+            "preserve_thinking"
+        ] = preserve_thinking
+
+    preserve_thinking = bool(
+        agent_config.get("agent_config_values", {}).get("preserve_thinking", True)
+    )
+    log(
+        "Preserve thinking "
+        + ("enabled" if preserve_thinking else "disabled")
+        + " for agent message history"
+    )
+
+    agent_config_file = output_dir / "agent_config.json"
+    with open(agent_config_file, "w") as f:
+        json.dump(agent_config, f, indent=2)
+
     # Run agent
     log("Running agent...")
     agent_cmd = [
@@ -736,7 +764,7 @@ Don't over-explain. Be concise but show your thinking.
         "--mcp-gateway-url",
         f"{ENV_URL}/mcp/",
         "--agent-config",
-        str(EXAMPLE_DIR / "agent_config.json"),
+        str(agent_config_file),
         "--orchestrator-model",
         orchestrator_config["model"],
         "--output",
