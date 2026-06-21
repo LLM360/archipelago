@@ -23,6 +23,27 @@ from runner.utils.settings import get_settings
 
 settings = get_settings()
 
+REQUEST_ID_HEADERS = ("x-trace-id", "x-request-id")
+
+
+def _sanitize_header_value(value: str) -> str:
+    return value.replace("\r", "").replace("\n", "")
+
+
+def _add_trajectory_headers(kwargs: dict[str, Any], trajectory_id: str | None) -> None:
+    if not trajectory_id:
+        return
+
+    request_id = _sanitize_header_value(str(trajectory_id))
+    if not request_id:
+        return
+
+    headers = dict(kwargs.get("extra_headers") or {})
+    for header in REQUEST_ID_HEADERS:
+        headers[header] = request_id
+    kwargs["extra_headers"] = headers
+
+
 # Configure LiteLLM proxy routing if configured
 if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
     litellm.use_litellm_proxy = True
@@ -82,6 +103,7 @@ def _is_non_retriable_bad_request(e: Exception) -> bool:
         "unauthorized",
         "unsupported parameter",
         "unsupported value",
+        "assistant message is missing a thinking field",
     ]
 
     return any(pattern in error_str for pattern in non_retriable_patterns)
@@ -140,6 +162,8 @@ async def generate_response(
 
     if tools:
         kwargs["tools"] = tools
+
+    _add_trajectory_headers(kwargs, trajectory_id)
 
     # If LiteLLM proxy is configured, add tracking tags
     if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
@@ -212,6 +236,8 @@ async def call_responses_api(
         "timeout": llm_response_timeout,
         **extra_args,
     }
+
+    _add_trajectory_headers(kwargs, trajectory_id)
 
     if settings.LITELLM_PROXY_API_BASE and settings.LITELLM_PROXY_API_KEY:
         kwargs["api_base"] = settings.LITELLM_PROXY_API_BASE

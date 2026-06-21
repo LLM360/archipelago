@@ -38,54 +38,104 @@ from .tools import (
 )
 
 
-def _ensure_assistant_reasoning_content(message: LitellmAnyMessage) -> None:
-    """Ensure assistant messages always include reasoning_content."""
-    if isinstance(message, dict):
-        if (
-            message.get("role") == "assistant"
-            and message.get("reasoning_content") is None
-        ):
-            message["reasoning_content"] = " "
+REASONING_FIELD = "reasoning_content"
+MISSING_REASONING = "-"
+THINKING_SOURCE_FIELDS = (
+    "reasoning_content",
+    "reasoning",
+    "think",
+    "think_fast",
+    "think_faster",
+)
+
+
+def _has_reasoning_text(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _find_reasoning_value(
+    data: dict[str, Any], provider_fields: dict[str, Any] | None
+) -> Any:
+    for source in (data, provider_fields):
+        if not isinstance(source, dict):
+            continue
+        for key in THINKING_SOURCE_FIELDS:
+            value = source.get(key)
+            if _has_reasoning_text(value):
+                return value
+    value = data.get(REASONING_FIELD, MISSING_REASONING)
+    return MISSING_REASONING if value is None else value
+
+
+def _normalize_assistant_reasoning(
+    data: dict[str, Any],
+    provider_fields: dict[str, Any] | None = None,
+    *,
+    remove_alternate_fields: bool = False,
+) -> None:
+    if data.get("role") != "assistant":
         return
 
-    if (
-        getattr(message, "role", None) == "assistant"
-        and getattr(message, "reasoning_content", None) is None
-    ):
-        setattr(message, "reasoning_content", "")
+    data[REASONING_FIELD] = _find_reasoning_value(data, provider_fields)
+    if remove_alternate_fields:
+        for key in THINKING_SOURCE_FIELDS:
+            if key != REASONING_FIELD:
+                data.pop(key, None)
 
 
-def _ensure_messages_reasoning_content(messages: list[LitellmAnyMessage]) -> None:
+def _ensure_assistant_reasoning(message: LitellmAnyMessage) -> None:
+    """Ensure assistant messages always include reasoning_content."""
+    if isinstance(message, dict):
+        _normalize_assistant_reasoning(
+            message, message.get("provider_specific_fields")
+        )
+        return
+
+    if getattr(message, "role", None) != "assistant":
+        return
+
+    for key in THINKING_SOURCE_FIELDS:
+        value = getattr(message, key, None)
+        if _has_reasoning_text(value):
+            setattr(message, REASONING_FIELD, value)
+            return
+
+    provider_fields = getattr(message, "provider_specific_fields", None)
+    setattr(message, REASONING_FIELD, _find_reasoning_value({}, provider_fields))
+
+
+def _ensure_messages_reasoning(messages: list[LitellmAnyMessage]) -> None:
     for message in messages:
-        _ensure_assistant_reasoning_content(message)
+        _ensure_assistant_reasoning(message)
+
+
+def _message_to_raw_dict(message: LitellmAnyMessage) -> dict[str, Any]:
+    if isinstance(message, dict):
+        return dict(message)
+    return message.model_dump(mode="json", exclude_none=True)
 
 
 def _message_to_dict(message: LitellmAnyMessage) -> dict[str, Any]:
-    if isinstance(message, dict):
-        data = dict(message)
-    else:
-        data = message.model_dump(mode="json", exclude_none=True)
-
-    _ensure_assistant_reasoning_content(data)
+    data = _message_to_raw_dict(message)
+    provider_fields = data.get("provider_specific_fields")
+    _normalize_assistant_reasoning(
+        data, provider_fields, remove_alternate_fields=True
+    )
     return data
 
 
 def _message_to_request_dict(message: LitellmAnyMessage) -> dict[str, Any]:
-    data = _message_to_dict(message)
+    data = _message_to_raw_dict(message)
     provider_fields = data.pop("provider_specific_fields", None)
-    if isinstance(provider_fields, dict):
-        for key in (
-            "reasoning_content",
-            "reasoning",
-            "think",
-            "think_fast",
-            "think_faster",
-        ):
-            if provider_fields.get(key) is not None:
-                if data.get(key) is None or data.get(key) == "":
-                    data[key] = provider_fields[key]
+    _normalize_assistant_reasoning(data, provider_fields)
 
-    _ensure_assistant_reasoning_content(data)
+    if data.get("role") == "assistant":
+        reasoning_value = data[REASONING_FIELD]
+        for key in THINKING_SOURCE_FIELDS:
+            data[key] = reasoning_value
+        if data.get("content") is None:
+            data["content"] = ""
+
     return data
 
 
@@ -114,7 +164,7 @@ class ReActAgent:
 
         self.messages: list[LitellmAnyMessage] = list(run_input.initial_messages)
         if self.preserve_thinking:
-            _ensure_messages_reasoning_content(self.messages)
+            _ensure_messages_reasoning(self.messages)
 
         if run_input.mcp_gateway_url is None:
             raise ValueError("MCP gateway URL is required for react toolbelt agent")
@@ -135,7 +185,9 @@ class ReActAgent:
         self.extra_args: dict[str, Any] = run_input.orchestrator_extra_args or {}
 
         # Components
-        self.resum: ReSumManager = ReSumManager(self.model, self.extra_args)
+        self.resum: ReSumManager = ReSumManager(
+            self.model, self.extra_args, trajectory_id=self.trajectory_id
+        )
 
         # Toolbelt state
         self.all_tools: dict[str, ChatCompletionToolParam] = {}
@@ -186,7 +238,7 @@ class ReActAgent:
                 logger.error(f"Summarization failed: {e}")
 
         if self.preserve_thinking:
-            _ensure_messages_reasoning_content(self.messages)
+            _ensure_messages_reasoning(self.messages)
             request_messages = _messages_to_request_dicts(self.messages)
         else:
             request_messages = self.messages
@@ -227,7 +279,7 @@ class ReActAgent:
 
         response_message = LitellmOutputMessage.model_validate(choices[0].message)
         if self.preserve_thinking:
-            _ensure_assistant_reasoning_content(response_message)
+            _ensure_assistant_reasoning(response_message)
         tool_calls = getattr(response_message, "tool_calls", None)
         content = getattr(response_message, "content", None)
 

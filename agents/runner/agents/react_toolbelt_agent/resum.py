@@ -84,9 +84,15 @@ class ReSumManager:
     Uses incremental summarization to update a running summary.
     """
 
-    def __init__(self, model: str, extra_args: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        model: str,
+        extra_args: dict[str, Any] | None = None,
+        trajectory_id: str | None = None,
+    ):
         self.model: str = model
         self.extra_args: dict[str, Any] = extra_args or {}
+        self.trajectory_id: str | None = trajectory_id
         self.running_summary: str | None = None
         self.messages_summarized: int = 0
         self.max_tokens: int = 128000
@@ -238,6 +244,7 @@ class ReSumManager:
             tools=[],
             llm_response_timeout=300,
             extra_args=self.extra_args,
+            trajectory_id=self.trajectory_id,
         )
 
         if not response.choices or not isinstance(response.choices[0], Choices):

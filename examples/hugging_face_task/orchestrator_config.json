@@ -1,7 +1,7 @@
 {
   "model": "openai/model-name",
   "extra_args": {
-    "api_base": "http://127.0.0.1:26462/v1",
+    "api_base": "http://127.0.0.1:32858/v1",
     "api_key": "dummy"
   }
 }
