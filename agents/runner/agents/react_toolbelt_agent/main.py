@@ -39,7 +39,7 @@ from .tools import (
 
 
 REASONING_FIELD = "reasoning_content"
-MISSING_REASONING = "-"
+MISSING_REASONING = ""
 THINKING_SOURCE_FIELDS = (
     "reasoning_content",
     "reasoning",
