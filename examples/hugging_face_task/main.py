@@ -148,6 +148,20 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def optional_env_flag(name: str) -> bool | None:
+    """Return a strict boolean override when an environment variable is set."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{name} must be true or false; got {value!r}")
+
+
 def load_agent_config() -> dict:
     """Load the base agent config and apply the optional environment selection."""
     with open(EXAMPLE_DIR / "agent_config.json") as f:
@@ -175,6 +189,9 @@ def load_agent_config() -> dict:
     values = dict(profile["agent_config_values"])
     if requested_id == configured_id:
         values.update(configured_values)
+    supports_vision = optional_env_flag("SUPPORTS_VISION")
+    if supports_vision is not None:
+        values["supports_vision"] = supports_vision
 
     config["agent_config_id"] = requested_id
     config["agent_name"] = profile["agent_name"]

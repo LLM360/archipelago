@@ -68,10 +68,15 @@ or pass `--agent-config-id react_toolbelt_agent` to `parallel_batch_run.py` to u
 the ReAct Toolbelt harness instead. Each choice receives matching agent defaults
 and system instructions.
 
-Both bundled profiles default to `supports_vision: false`. In this mode,
-image-returning tools/actions are hidden and blocked before execution, with a
-result-conversion guard preventing unexpected MCP image blocks from reaching the
-text-only model.
+Both bundled profiles default to `supports_vision: false`. Set
+`SUPPORTS_VISION=true` or pass `--supports-vision` to `parallel_batch_run.py`
+when the selected model accepts image inputs. Pass `--no-supports-vision` to
+override an enabled environment setting. In text-only mode, image-returning
+tools/actions are hidden and blocked before execution, with a result-conversion
+guard preventing unexpected MCP image blocks from reaching the model.
+
+This setting controls model capabilities; `--include-vision-tasks` separately
+controls whether the batch runner selects benchmark tasks that require vision.
 
 ## How It Works
 

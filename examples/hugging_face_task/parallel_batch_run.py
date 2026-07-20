@@ -491,6 +491,7 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
         env["SKIP_MCP_CONFIG"] = "1"
     env["OUTPUT_DIR"] = str(args.output_root)
     env["AGENT_CONFIG_ID"] = args.agent_config_id
+    env["SUPPORTS_VISION"] = "1" if args.supports_vision else "0"
     env["PRESERVE_THINKING"] = "1" if args.preserve_thinking else "0"
 
     cmd = [sys.executable, str(EXAMPLE_DIR / "main.py"), item.task_id]
@@ -514,6 +515,7 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
                 f"project={spec.project_name}\n"
                 f"port={spec.port}\n"
                 f"agent_config_id={args.agent_config_id}\n"
+                f"supports_vision={args.supports_vision}\n"
                 f"preserve_thinking={args.preserve_thinking}\n"
                 f"cmd={' '.join(cmd)}\n\n"
             )
@@ -627,6 +629,20 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    """Read a strict boolean environment variable."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{name} must be true or false; got {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run HuggingFace benchmark tasks in parallel with isolated Docker Compose workers.",
@@ -644,6 +660,21 @@ def parse_args() -> argparse.Namespace:
         choices=AGENT_CONFIG_IDS,
         default=os.environ.get("AGENT_CONFIG_ID", "loop_agent"),
         help="Agent harness used for every task",
+    )
+    vision_group = parser.add_mutually_exclusive_group()
+    vision_group.add_argument(
+        "--supports-vision",
+        dest="supports_vision",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Allow image-returning tools and model image inputs",
+    )
+    vision_group.add_argument(
+        "--no-supports-vision",
+        dest="supports_vision",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="Disable image-returning tools and model image inputs (default)",
     )
     parser.add_argument(
         "--output-root",
@@ -686,6 +717,8 @@ def parse_args() -> argparse.Namespace:
         help="Disable assistant reasoning_content preservation",
     )
     args = parser.parse_args()
+    if not hasattr(args, "supports_vision"):
+        args.supports_vision = env_bool("SUPPORTS_VISION", False)
     if not hasattr(args, "preserve_thinking"):
         args.preserve_thinking = True
 
@@ -712,6 +745,7 @@ def main() -> None:
 
     log(f"Orchestrator model: {orchestrator_model}")
     log(f"Agent harness: {args.agent_config_id}")
+    log(f"Supports vision: {args.supports_vision}")
     log(f"Output root: {args.output_root}")
 
     tasks = select_tasks(args)
