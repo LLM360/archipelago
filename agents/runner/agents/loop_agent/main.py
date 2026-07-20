@@ -27,7 +27,12 @@ from runner.agents.models import (
 )
 from runner.utils.error import is_fatal_mcp_error, is_system_error
 from runner.utils.llm import generate_response
-from runner.utils.mcp import build_mcp_gateway_schema, content_blocks_to_messages
+from runner.utils.mcp import (
+    build_mcp_gateway_schema,
+    content_blocks_to_messages,
+    filter_mcp_tools_for_model,
+    get_multimodal_tool_call_block_reason,
+)
 from runner.utils.usage import UsageTracker
 
 
@@ -67,6 +72,7 @@ class LoopAgent:
         self.llm_response_timeout: int = config.get("llm_response_timeout", 600)
         self.max_steps: int = config.get("max_steps", 100)
         self.timeout: int = config.get("timeout", 10800)  # 3 hours
+        self.supports_vision: bool = config.get("supports_vision", True)
 
         self.extra_args: dict[str, Any] = run_input.orchestrator_extra_args or {}
 
@@ -81,6 +87,7 @@ class LoopAgent:
             tools: list[ChatCompletionToolParam] = await load_mcp_tools(
                 client.session, format="openai"
             )  # pyright: ignore[reportAssignmentType]
+        tools = filter_mcp_tools_for_model(tools, self.supports_vision)
 
         logger.bind(
             message_type="configure",
@@ -167,6 +174,23 @@ class LoopAgent:
 
                     tool_result_logger = tool_logger.bind(message_type="tool_result")
 
+                    block_reason = get_multimodal_tool_call_block_reason(
+                        name,
+                        tool_call.function.arguments,
+                        self.supports_vision,
+                    )
+                    if block_reason:
+                        tool_result_logger.warning(block_reason)
+                        self.messages.append(
+                            LitellmOutputMessage(
+                                role="tool",
+                                tool_call_id=tool_call.id,
+                                name=name,
+                                content=block_reason,
+                            )
+                        )
+                        continue
+
                     try:
                         call_result = await asyncio.wait_for(
                             call_openai_tool(client.session, tool_call),
@@ -230,6 +254,7 @@ class LoopAgent:
                         tool_call.function.name or "unknown",
                         self.model,
                         deferred_image_messages=deferred_image_messages,
+                        supports_vision=self.supports_vision,
                     )
 
                     tool_result_logger.bind(

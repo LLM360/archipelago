@@ -48,6 +48,7 @@ AGENT_CONFIG_PROFILES = {
             "max_steps": 100,
             "tool_call_timeout": 60,
             "llm_response_timeout": 600,
+            "supports_vision": False,
         },
     },
     "react_toolbelt_agent": {
@@ -56,6 +57,7 @@ AGENT_CONFIG_PROFILES = {
             "timeout": 3600,
             "max_steps": 250,
             "preserve_thinking": True,
+            "supports_vision": False,
         },
     },
 }
@@ -125,6 +127,14 @@ AGENT_SYSTEM_PROMPTS = {
     "loop_agent": LOOP_AGENT_SYSTEM_PROMPT,
     "react_toolbelt_agent": REACT_TOOLBELT_SYSTEM_PROMPT,
 }
+
+TEXT_ONLY_MODEL_INSTRUCTIONS = """## Model Modality
+
+This run uses a text-only model. Do not request image output. Image-returning
+tools/actions such as `read_image_file`, `read_image`, and `page_as_image` are
+disabled. Use text extraction, document content, slide metadata, or PDF page text
+instead.
+"""
 
 
 def log(msg: str):
@@ -802,6 +812,8 @@ def main():
     agent_config = load_agent_config()
     agent_config_id = agent_config["agent_config_id"]
     system_prompt = AGENT_SYSTEM_PROMPTS[agent_config_id]
+    if not agent_config["agent_config_values"].get("supports_vision", True):
+        system_prompt = f"{system_prompt.rstrip()}\n\n{TEXT_ONLY_MODEL_INSTRUCTIONS}"
     log(f"Agent harness: {agent_config_id}")
     initial_messages = [
         {"role": "system", "content": system_prompt},

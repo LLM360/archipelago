@@ -68,6 +68,11 @@ or pass `--agent-config-id react_toolbelt_agent` to `parallel_batch_run.py` to u
 the ReAct Toolbelt harness instead. Each choice receives matching agent defaults
 and system instructions.
 
+Both bundled profiles default to `supports_vision: false`. In this mode,
+image-returning tools/actions are hidden and blocked before execution, with a
+result-conversion guard preventing unexpected MCP image blocks from reaching the
+text-only model.
+
 ## How It Works
 
 Unlike `simple_task` which uses static pre-defined files, this example dynamically fetches everything from HuggingFace:

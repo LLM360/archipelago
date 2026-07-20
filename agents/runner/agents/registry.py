@@ -48,6 +48,13 @@ AGENT_REGISTRY: dict[AgentConfigIds, AgentDefn] = {
                 min_value=30,
                 max_value=1200,
             ),
+            TaskFieldSchema(
+                field_id="supports_vision",
+                field_type=TaskFieldType.BOOLEAN,
+                label="Supports Vision",
+                description="Allow image-returning tools and image inputs",
+                default_value=True,
+            ),
         ],
     ),
     AgentConfigIds.REACT_TOOLBELT_AGENT: AgentDefn(
@@ -80,6 +87,13 @@ AGENT_REGISTRY: dict[AgentConfigIds, AgentDefn] = {
                     "Preserve assistant thinking fields when replaying message history. "
                     "This keeps or fills reasoning_content for models that require it."
                 ),
+                default_value=True,
+            ),
+            TaskFieldSchema(
+                field_id="supports_vision",
+                field_type=TaskFieldType.BOOLEAN,
+                label="Supports Vision",
+                description="Allow image-returning tools and image inputs",
                 default_value=True,
             ),
         ],

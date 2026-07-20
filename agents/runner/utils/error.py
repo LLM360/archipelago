@@ -43,7 +43,7 @@ def is_system_error(exception: Exception) -> bool:
         if (
             "context" in error_str
             or "token" in error_str
-            or "is not a multimodal model" in error_str
+            or "not a multimodal model" in error_str
         ):
             return False  # Model error
         return True  # System error (configuration/infrastructure issue)

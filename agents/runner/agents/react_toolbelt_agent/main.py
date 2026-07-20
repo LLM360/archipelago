@@ -24,7 +24,12 @@ from runner.agents.models import (
 )
 from runner.utils.error import is_fatal_mcp_error, is_system_error
 from runner.utils.llm import generate_response
-from runner.utils.mcp import build_mcp_gateway_schema, content_blocks_to_messages
+from runner.utils.mcp import (
+    build_mcp_gateway_schema,
+    content_blocks_to_messages,
+    filter_mcp_tools_for_model,
+    get_multimodal_tool_call_block_reason,
+)
 from runner.utils.usage import UsageTracker
 
 from .resum import ReSumManager
@@ -181,6 +186,7 @@ class ReActAgent:
         self.tool_call_timeout: int = 60
         self.llm_response_timeout: int = 600
         self.max_toolbelt_size: int = 80
+        self.supports_vision: bool = config.get("supports_vision", True)
 
         self.extra_args: dict[str, Any] = run_input.orchestrator_extra_args or {}
 
@@ -212,6 +218,7 @@ class ReActAgent:
         tools: list[ChatCompletionToolParam] = await load_mcp_tools(
             client.session, format="openai"
         )  # pyright: ignore[reportAssignmentType]
+        tools = filter_mcp_tools_for_model(tools, self.supports_vision)
 
         for tool in tools:
             name = tool.get("function", {}).get("name")
@@ -452,6 +459,23 @@ class ReActAgent:
 
         tool_result_logger = tool_logger.bind(message_type="tool_result")
 
+        block_reason = get_multimodal_tool_call_block_reason(
+            name,
+            tool_call.function.arguments,
+            self.supports_vision,
+        )
+        if block_reason:
+            tool_result_logger.warning(block_reason)
+            self.messages.append(
+                LitellmOutputMessage(
+                    role="tool",
+                    tool_call_id=tool_call.id,
+                    name=name,
+                    content=block_reason,
+                )
+            )
+            return
+
         try:
             result = await asyncio.wait_for(
                 call_openai_tool(client.session, tool_call),
@@ -513,6 +537,7 @@ class ReActAgent:
             name,
             self.model,
             deferred_image_messages=deferred_image_messages,
+            supports_vision=self.supports_vision,
         )
         truncate_tool_messages(messages, self.model)
         self.messages.extend(messages)

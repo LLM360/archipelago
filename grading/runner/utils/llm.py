@@ -68,6 +68,7 @@ def _is_non_retriable_error(e: Exception) -> bool:
         "authentication failed",
         "unauthorized",
         "invalid base64",
+        "not a multimodal model",
     ]
 
     return any(pattern in error_str for pattern in non_retriable_patterns)

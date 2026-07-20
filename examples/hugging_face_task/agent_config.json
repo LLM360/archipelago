@@ -5,6 +5,7 @@
     "timeout": 3600,
     "max_steps": 100,
     "tool_call_timeout": 60,
-    "llm_response_timeout": 600
+    "llm_response_timeout": 600,
+    "supports_vision": false
   }
 }

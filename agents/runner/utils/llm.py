@@ -104,6 +104,7 @@ def _is_non_retriable_bad_request(e: Exception) -> bool:
         "unsupported parameter",
         "unsupported value",
         "assistant message is missing a thinking field",
+        "not a multimodal model",
     ]
 
     return any(pattern in error_str for pattern in non_retriable_patterns)
