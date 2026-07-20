@@ -63,6 +63,11 @@ Results are saved to `output/<task_id>/`:
 | `agent_config.json` | Agent configuration used |
 | `verifiers.json` | Grading criteria (from HuggingFace rubric) |
 
+The default harness is `loop_agent`. Set `AGENT_CONFIG_ID=react_toolbelt_agent`
+or pass `--agent-config-id react_toolbelt_agent` to `parallel_batch_run.py` to use
+the ReAct Toolbelt harness instead. Each choice receives matching agent defaults
+and system instructions.
+
 ## How It Works
 
 Unlike `simple_task` which uses static pre-defined files, this example dynamically fetches everything from HuggingFace:

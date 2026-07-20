@@ -40,6 +40,92 @@ SUBSYSTEMS = ["filesystem", ".apps_data"]
 # Default task: Investment Banking World 221 - BBDC/TVPG accretion/dilution sensitivity analysis
 DEFAULT_TASK = "task_9ba58a6197114140877a1df1754d2993"
 
+AGENT_CONFIG_PROFILES = {
+    "loop_agent": {
+        "agent_name": "Loop Agent",
+        "agent_config_values": {
+            "timeout": 3600,
+            "max_steps": 100,
+            "tool_call_timeout": 60,
+            "llm_response_timeout": 600,
+        },
+    },
+    "react_toolbelt_agent": {
+        "agent_name": "React Toolbelt Agent",
+        "agent_config_values": {
+            "timeout": 3600,
+            "max_steps": 250,
+            "preserve_thinking": True,
+        },
+    },
+}
+
+LOOP_AGENT_SYSTEM_PROMPT = """You are an AI assistant that completes tasks by reasoning and using tools.
+
+## Think Before Acting
+
+Before making tool calls, briefly explain your reasoning in 1-3 sentences:
+- What you learned from the previous step
+- What you're doing next and why
+
+Don't over-explain. Be concise but show your thinking.
+
+## Tools
+
+All available domain tools are provided directly. Use them as needed to complete the task.
+
+## Workflow
+
+1. Understand the requested outcome
+2. Use the available tools to gather information and make the required changes
+3. Verify the result when possible
+4. When the task is complete, respond with the final answer without calling another tool
+
+## Rules
+
+- Continue using tools while work remains
+- Show your work for calculations
+- A response without tool calls ends the run, so only provide it when you are finished
+"""
+
+REACT_TOOLBELT_SYSTEM_PROMPT = """You are an AI assistant that completes tasks by reasoning and using tools.
+
+## Think Before Acting
+
+Before making tool calls, briefly explain your reasoning in 1-3 sentences:
+- What you learned from the previous step
+- What you're doing next and why
+
+Don't over-explain. Be concise but show your thinking.
+
+## Tools
+
+**Always Available (Meta-Tools):**
+- `todo_write` - Task planning: create/update todos. Takes `todos` array [{id, content, status}] and `merge` boolean.
+- `toolbelt_list_tools` / `toolbelt_inspect_tool` / `toolbelt_add_tool` / `toolbelt_remove_tool` - Tool management
+- `final_answer` - Submit your answer (status: completed/blocked/failed)
+
+**Domain Tools:** Use `toolbelt_list_tools` to discover, then `toolbelt_add_tool` to add them.
+
+## Workflow
+
+1. Plan: Use `todo_write` to create todos for complex tasks
+2. Discover: Use `toolbelt_list_tools` to find relevant tools
+3. Execute: Work through todos, use `todo_write` with `merge=true` to update status
+4. Complete: Call `final_answer` (all todos must be completed/cancelled first)
+
+## Rules
+
+- Update todo status with `todo_write`: set `in_progress` when starting, `completed` when done
+- Show your work for calculations
+- `final_answer` is rejected if todos are incomplete
+"""
+
+AGENT_SYSTEM_PROMPTS = {
+    "loop_agent": LOOP_AGENT_SYSTEM_PROMPT,
+    "react_toolbelt_agent": REACT_TOOLBELT_SYSTEM_PROMPT,
+}
+
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -50,6 +136,40 @@ def env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_agent_config() -> dict:
+    """Load the base agent config and apply the optional environment selection."""
+    with open(EXAMPLE_DIR / "agent_config.json") as f:
+        config = json.load(f)
+
+    if not isinstance(config, dict):
+        raise SystemExit("agent_config.json must contain a JSON object")
+
+    configured_id = str(config.get("agent_config_id", "loop_agent")).strip()
+    requested_id = os.environ.get("AGENT_CONFIG_ID", configured_id).strip()
+    if requested_id not in AGENT_CONFIG_PROFILES:
+        supported = ", ".join(sorted(AGENT_CONFIG_PROFILES))
+        raise SystemExit(
+            f"Unsupported AGENT_CONFIG_ID={requested_id!r}; choose one of: {supported}"
+        )
+
+    profile = AGENT_CONFIG_PROFILES[requested_id]
+    configured_values = config.get("agent_config_values", {})
+    if not isinstance(configured_values, dict):
+        raise SystemExit("agent_config.json agent_config_values must be a JSON object")
+
+    # Preserve checked-in/custom values when the file already targets this agent.
+    # When the environment switches agent types, start from that agent's defaults
+    # so ReAct-only settings do not leak into Loop (and vice versa).
+    values = dict(profile["agent_config_values"])
+    if requested_id == configured_id:
+        values.update(configured_values)
+
+    config["agent_config_id"] = requested_id
+    config["agent_name"] = profile["agent_name"]
+    config["agent_config_values"] = values
+    return config
 
 
 def project_python_cmd(project_dir: Path, override_env: str) -> list[str]:
@@ -678,40 +798,11 @@ def main():
     else:
         configure_mcp_servers()
 
-    # Generate initial messages from HuggingFace task prompt
-    # System prompt from agents/runner/agents/react_toolbelt_agent/README.md
-    system_prompt = """You are an AI assistant that completes tasks by reasoning and using tools.
-
-## Think Before Acting
-
-Before making tool calls, briefly explain your reasoning in 1-3 sentences:
-- What you learned from the previous step
-- What you're doing next and why
-
-Don't over-explain. Be concise but show your thinking.
-
-## Tools
-
-**Always Available (Meta-Tools):**
-- `todo_write` - Task planning: create/update todos. Takes `todos` array [{id, content, status}] and `merge` boolean.
-- `toolbelt_list_tools` / `toolbelt_inspect_tool` / `toolbelt_add_tool` / `toolbelt_remove_tool` - Tool management
-- `final_answer` - Submit your answer (status: completed/blocked/failed)
-
-**Domain Tools:** Use `toolbelt_list_tools` to discover, then `toolbelt_add_tool` to add them.
-
-## Workflow
-
-1. Plan: Use `todo_write` to create todos for complex tasks
-2. Discover: Use `toolbelt_list_tools` to find relevant tools
-3. Execute: Work through todos, use `todo_write` with `merge=true` to update status
-4. Complete: Call `final_answer` (all todos must be completed/cancelled first)
-
-## Rules
-
-- Update todo status with `todo_write`: set `in_progress` when starting, `completed` when done
-- Show your work for calculations
-- `final_answer` is rejected if todos are incomplete
-"""
+    # Generate initial messages using instructions that match the selected harness.
+    agent_config = load_agent_config()
+    agent_config_id = agent_config["agent_config_id"]
+    system_prompt = AGENT_SYSTEM_PROMPTS[agent_config_id]
+    log(f"Agent harness: {agent_config_id}")
     initial_messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": task["prompt"]},
@@ -723,29 +814,27 @@ Don't over-explain. Be concise but show your thinking.
     with open(EXAMPLE_DIR / "orchestrator_config.json") as f:
         orchestrator_config = json.load(f)
 
-    with open(EXAMPLE_DIR / "agent_config.json") as f:
-        agent_config = json.load(f)
+    if agent_config_id == "react_toolbelt_agent":
+        preserve_thinking_env = os.environ.get("PRESERVE_THINKING")
+        preserved_thinking_env = os.environ.get("PRESERVED_THINKING")
+        if preserve_thinking_env is not None or preserved_thinking_env is not None:
+            preserve_thinking = (
+                env_flag("PRESERVE_THINKING")
+                if preserve_thinking_env is not None
+                else env_flag("PRESERVED_THINKING")
+            )
+            agent_config.setdefault("agent_config_values", {})[
+                "preserve_thinking"
+            ] = preserve_thinking
 
-    preserve_thinking_env = os.environ.get("PRESERVE_THINKING")
-    preserved_thinking_env = os.environ.get("PRESERVED_THINKING")
-    if preserve_thinking_env is not None or preserved_thinking_env is not None:
-        preserve_thinking = (
-            env_flag("PRESERVE_THINKING")
-            if preserve_thinking_env is not None
-            else env_flag("PRESERVED_THINKING")
+        preserve_thinking = bool(
+            agent_config.get("agent_config_values", {}).get("preserve_thinking", True)
         )
-        agent_config.setdefault("agent_config_values", {})[
-            "preserve_thinking"
-        ] = preserve_thinking
-
-    preserve_thinking = bool(
-        agent_config.get("agent_config_values", {}).get("preserve_thinking", True)
-    )
-    log(
-        "Preserve thinking "
-        + ("enabled" if preserve_thinking else "disabled")
-        + " for agent message history"
-    )
+        log(
+            "Preserve thinking "
+            + ("enabled" if preserve_thinking else "disabled")
+            + " for agent message history"
+        )
 
     agent_config_file = output_dir / "agent_config.json"
     with open(agent_config_file, "w") as f:

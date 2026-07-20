@@ -47,6 +47,7 @@ EXAMPLE_DIR = Path(__file__).parent.resolve()
 ARCHIPELAGO_DIR = Path(os.environ.get("ARCHIPELAGO_DIR", EXAMPLE_DIR.parent.parent)).resolve()
 ENVIRONMENT_DIR = Path(os.environ.get("ENVIRONMENT_DIR", ARCHIPELAGO_DIR / "environment")).resolve()
 HF_DATASET = "mercor/apex-agents"
+AGENT_CONFIG_IDS = ("loop_agent", "react_toolbelt_agent")
 
 DEFAULT_EXCLUDED_WORLD_NAMES = {
     "Investment Banking World 244",
@@ -489,6 +490,7 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
         env["REUSE_ENVIRONMENT"] = "1"
         env["SKIP_MCP_CONFIG"] = "1"
     env["OUTPUT_DIR"] = str(args.output_root)
+    env["AGENT_CONFIG_ID"] = args.agent_config_id
     env["PRESERVE_THINKING"] = "1" if args.preserve_thinking else "0"
 
     cmd = [sys.executable, str(EXAMPLE_DIR / "main.py"), item.task_id]
@@ -511,6 +513,7 @@ def run_single(item: RunItem, spec: WorkerSpec, args: argparse.Namespace) -> tup
                 f"worker={spec.worker_id}\n"
                 f"project={spec.project_name}\n"
                 f"port={spec.port}\n"
+                f"agent_config_id={args.agent_config_id}\n"
                 f"preserve_thinking={args.preserve_thinking}\n"
                 f"cmd={' '.join(cmd)}\n\n"
             )
@@ -637,6 +640,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="Max selected tasks to process; 0 means all")
     parser.add_argument("--task-timeout", type=int, default=7200, help="Seconds per (task, trial) attempt")
     parser.add_argument(
+        "--agent-config-id",
+        choices=AGENT_CONFIG_IDS,
+        default=os.environ.get("AGENT_CONFIG_ID", "loop_agent"),
+        help="Agent harness used for every task",
+    )
+    parser.add_argument(
         "--output-root",
         default=os.environ.get("OUTPUT_DIR", ""),
         help="Directory for run outputs; defaults to outputs/<model_name> under this example",
@@ -688,6 +697,11 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit("--limit must be >= 0")
     if args.task_timeout < 1:
         raise SystemExit("--task-timeout must be >= 1")
+    if args.agent_config_id not in AGENT_CONFIG_IDS:
+        raise SystemExit(
+            f"Invalid --agent-config-id: {args.agent_config_id}; "
+            f"choose one of {', '.join(AGENT_CONFIG_IDS)}"
+        )
     return args
 
 
@@ -697,6 +711,7 @@ def main() -> None:
     args.output_root = resolve_output_root(args.output_root, orchestrator_model)
 
     log(f"Orchestrator model: {orchestrator_model}")
+    log(f"Agent harness: {args.agent_config_id}")
     log(f"Output root: {args.output_root}")
 
     tasks = select_tasks(args)
